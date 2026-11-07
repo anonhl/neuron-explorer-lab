@@ -1,6 +1,9 @@
 [project]
-name = "neuron-explorer"
+name = "neuron-explorer-lab"
 version = "0.1.0"
+description = "Windows-focused extensions of neuron-explorer for reproducible neuron and residual-stream experiments"
+readme = "README.md"
+license = "MIT"
 requires-python = ">=3.11"
 dependencies = [
     "torch",
@@ -14,3 +17,17 @@ dependencies = [
     "sentence-transformers>=6.1.0",
     "umap-learn>=0.5.12",
 ]
+
+[project.optional-dependencies]
+bitsandbytes = ["bitsandbytes>=0.48.0"]
+hqq = ["hqq>=0.2.7"]
+quantization = ["bitsandbytes>=0.48.0", "hqq>=0.2.7"]
+lora = ["peft>=0.19.1"]
+
+[dependency-groups]
+dev = ["httpx>=0.28.1"]
+
+[project.urls]
+Repository = "https://github.com/anonhl/neuron-explorer-lab"
+Documentation = "https://github.com/anonhl/neuron-explorer-lab/blob/main/docs/README.md"
+Upstream = "https://github.com/lyramakesmusic/neuron-explorer"

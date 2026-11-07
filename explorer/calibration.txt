@@ -1,0 +1,34 @@
+清晨六点，窗外下着小雨。李华给猫倒了一碗水，把伞放进背包，然后沿着河边走到车站。公交车比平时晚了十分钟，站牌上的电子屏显示下一班车已经出发。她给同事发了一条消息，说自己会在九点前到办公室。
+
+问：冰箱里有三个鸡蛋、半瓶牛奶和一盒草莓，可以做什么早餐？
+答：可以做一份煎蛋，再把洗净的草莓切成小块。牛奶可以直接喝，也可以用来冲燕麦。做饭之前先检查食材的保质期。
+
+猫趴在书架顶上，看着窗台上的鸟。狗听见开门的声音，从客厅跑了过来。孩子们收好画笔，把刚画好的地图贴在墙上。他们约好周末去公园找那棵树，在树下交换各自最喜欢的故事。
+
+如果一个班有三十名学生，其中十二人参加合唱，九人参加绘画，四人同时参加这两项活动，那么至少参加其中一项的人数为十二加九减四，等于十七。计算时需要把同时参加的人只数一次。
+
+图书馆通知：阅览室周一闭馆，周二至周日开放。借阅证可以在一楼服务台办理。归还图书时，请将书放在自助机器右侧的托盘上。如果设备显示错误，请记录提示内容并联系值班人员。
+
+在实验中，我们把相同的种子分成三组，分别放在不同光照条件下。每隔两天测量一次幼苗的高度，并记录土壤温度。第三组虽然发芽较晚，但最终的平均高度与第一组接近。这个结果需要在更大的样本上复核。
+
+会议纪要：先核对上周的订单，再讨论新版本的发布计划。测试人员报告了两个问题，一个出现在登录页，另一个和文件名中的空格有关。负责人安排周三修复，周四重新检查，并把结果写进发布说明。
+
+春天的风从山谷吹过来，沿路的桃树开了花。我们走过一座石桥，在村口买了热茶。老板说，沿着青石路再走十五分钟就能看到旧水车。天快黑的时候，山上的灯亮了，回程的路比来时安静。
+
+The morning train was crowded, but the last carriage had two empty seats. I put my bag under the seat and watched the streets turn into fields. At the next station, a family stepped onto the platform and waved until the train disappeared around the bend.
+
+To make the sauce, warm a spoonful of oil in a small pan. Add the chopped onions and stir until they soften. Pour in the tomatoes, lower the heat, and cook for twenty minutes. Taste it before adding more salt.
+
+Question: What is the difference between a thermometer and a thermostat?
+Answer: A thermometer measures temperature. A thermostat uses a temperature measurement to decide whether heating or cooling should be turned on.
+
+The committee reviewed three proposals. The first was the cheapest, the second could be delivered sooner, and the third included additional testing. After checking the schedule and the maintenance costs, they asked each supplier for a revised estimate by Friday.
+
+A small program can count how often each word appears:
+def count_words(words):
+    counts = {}
+    for word in words:
+        counts[word] = counts.get(word, 0) + 1
+    return counts
+
+On Monday the team checks the incoming files. On Tuesday they compare the totals with the previous report. If a number has changed, they trace it back to the original row and write down what caused the difference. They keep the old report so that the comparison can be repeated.

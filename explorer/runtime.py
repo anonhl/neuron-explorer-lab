@@ -1,4 +1,4 @@
-"""Live Qwen3.5 model for the explorer: steered generation (add or multiply one neuron, per batch row), per-token
+"""Live Qwen3.5 model for the explorer: steered generation (add or multiply neuron activations), per-token
 neuron activations on arbitrary text, and logit-lens tokens for a neuron's down column.
 
 The hook sits on the input of a layer's down_proj, where the neuron activations silu(gate) * up live, so add,
@@ -6,15 +6,25 @@ multiply, and reading are all exact. Add doses are in units of the median residu
 unit as the sweep's `--dose-unit rel`.
 """
 import json
+import math
 import os
 import sqlite3
 import threading
+import gc
+import hashlib
+from itertools import islice
+from pathlib import Path
+from uuid import uuid4
 
 import numpy as np
 import torch
 import torch.nn.functional as F
-from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
+from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration, core_model_loading
 from transformers.models.qwen3_5.modeling_qwen3_5 import apply_rotary_pos_emb, l2norm
+if __package__:
+    from .quantization import linear_weight, make_quantization_config, prepare_weight_only_model, resolve_compute_dtype, validate_environment, weight_format
+else:
+    from quantization import linear_weight, make_quantization_config, prepare_weight_only_model, resolve_compute_dtype, validate_environment, weight_format
 
 MODEL = os.environ.get("EXPLORER_MODEL", "Qwen/Qwen3.5-4B")
 NO_MODEL = bool(os.environ.get("EXPLORER_NO_MODEL"))  # cache-only: never download or load weights
@@ -28,6 +38,11 @@ REFERENCE_TEXT = (
 
 CACHE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
 RJPP = os.path.join(CACHE, "rjpp")  # bubskee/qwen3.5-4b-r-jpp-lenses, downloaded here
+_weight_progress_lock = threading.Lock()
+
+
+class ModelLoadRequired(RuntimeError):
+    """The server is waiting for the user to select and load a model."""
 
 
 def _locked(f):
@@ -41,8 +56,9 @@ def _locked(f):
 
 
 class Runtime:
-    def __init__(self, stats_dir):
+    def __init__(self, stats_dir, *, load_on_demand=True):
         self.stats_dir = stats_dir
+        self.load_on_demand = load_on_demand
         os.makedirs(CACHE, exist_ok=True)
         self._db = sqlite3.connect(os.path.join(CACHE, "connections.sqlite"), check_same_thread=False)
         self._db.execute("CREATE TABLE IF NOT EXISTS con (key TEXT PRIMARY KEY, val TEXT)")
@@ -51,60 +67,235 @@ class Runtime:
         self._con_idx = None
         self.lock = threading.RLock()  # re-entrant: a locked method can call another
         self.model = self.tok = None
-        self.status = "idle"
+        self.lora_path = None
+        self.lora_act_scale = None
+        self._lora_cache_id = None
+        self.set_load_state("no model" if NO_MODEL else "idle")
         self.resid_p50 = {}
         self._push = None  # [(layer, neuron, mode, per-row values tensor)], any number of neurons at once (neuron None = all)
+        self._batch_push = ()  # persistent for this model session: (layer, neuron, mode, raw value)
+        self._active_batch = None
         self._heads = None  # [(layer, head, scale)]: attention heads scaled (0 = ablated) during a read; head None = all
-        self._read = None  # (layer, neuron) while reading
+        self._read = None  # (neurons by layer, captured activations) while reading
         self._seen = {}
         self._con_cache = {}
         self._capture_all = None
         self._capture_from = 0
         self._capture_full = None
+        self._capture_residuals = None
         self._capture_heads = None  # while set: each layer's query/key side and each head's write size, per token
         self.heads = None  # the last text's captures: {"T", "q", "writes"}, see full_activations(heads=True)
         self._lens_cache = {}
+        try:
+            with open(os.path.join(CACHE, "model_loading.json"), encoding="utf-8") as f:
+                saved = json.load(f)
+            if not isinstance(saved, dict):
+                saved = {}
+        except (OSError, ValueError):
+            saved = {}
+        self.quantization = saved.get("quantization", "none")
+        try:
+            weight_format(self.quantization)
+        except ValueError:
+            self.quantization = "none"
+        self.compute_dtype = saved.get("compute_dtype", "bfloat16")
+        try:
+            resolve_compute_dtype(self.compute_dtype)
+        except ValueError:
+            self.compute_dtype = "bfloat16"
+        self.quantization = os.environ.get("EXPLORER_QUANTIZATION") or self.quantization
+        self.compute_dtype = os.environ.get("EXPLORER_COMPUTE_DTYPE") or self.compute_dtype
+        weight_format(self.quantization)
+        resolve_compute_dtype(self.compute_dtype)
+
+    @staticmethod
+    def device():
+        # Prefer CUDA for quantization on Windows/Linux, retaining the original MPS/CPU fallback.
+        return "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+    @property
+    def status(self):
+        return self._load_state["status"]
+
+    @property
+    def load_error(self):
+        return self._load_state["error"]
+
+    def set_load_state(self, status, phase=None, completed=None, total=None, error=None):
+        progress = {"phase": phase, "completed": completed, "total": total} if phase else None
+        # Publish one snapshot. Status requests must be able to read it while the model lock is held.
+        self._load_state = {"status": status, "error": error, "progress": progress}
+
+    def loading_info(self):
+        return {"quantization": self.quantization, "compute_dtype": self.compute_dtype,
+                "activation_dtype": self.compute_dtype, "device": self.device(),
+                "live_model": not NO_MODEL, "lora_path": self.lora_path, **self._load_state}
+
+    def _weight_cache_key(self, key):
+        if self._lora_cache_id:
+            return f"lora:{self._lora_cache_id}:{key}"
+        if self.quantization == "none" and self.compute_dtype == "bfloat16" and MODEL == "Qwen/Qwen3.5-4B":
+            return key  # preserve shipped baseline caches
+        model_id = hashlib.sha256(MODEL.encode()).hexdigest()[:16]
+        return f"{model_id}:{self.quantization}:{self.compute_dtype}:{key}"
+
+    def select_quantization(self, preset, compute_dtype=None, lora_path=None):
+        """Called under the model lock while the server pauses other API requests."""
+        if NO_MODEL:
+            raise ValueError("Live model disabled (EXPLORER_NO_MODEL)")
+        compute_dtype = self.compute_dtype if compute_dtype is None else compute_dtype
+        resolve_compute_dtype(compute_dtype)
+        validate_environment(preset, self.device())
+        # Check optional libraries/configs before releasing a working model.
+        make_quantization_config(preset, compute_dtype)
+        lora_path = lora_path.strip() if lora_path else None
+        if lora_path:
+            if preset != "none":
+                raise ValueError("LoRA requires full weights (BF16 or FP16).")
+            path = Path(lora_path).expanduser().resolve()
+            if not all((path / name).is_file() for name in ("adapter_config.json", "adapter_model.safetensors")):
+                raise ValueError("Select a local LoRA folder containing adapter_config.json and adapter_model.safetensors.")
+            try:
+                from peft import PeftConfig
+            except ImportError as exc:
+                raise ImportError("Install PEFT in the server's Python environment to load LoRA.") from exc
+            config = PeftConfig.from_pretrained(str(path), local_files_only=True)
+            if config.peft_type != "LORA":
+                raise ValueError("The selected folder does not contain a PEFT LoRA adapter.")
+            if not Path(MODEL).is_dir() and config.base_model_name_or_path != MODEL:
+                raise ValueError(f"LoRA expects base model {config.base_model_name_or_path!r}, but EXPLORER_MODEL is {MODEL!r}.")
+            lora_path = str(path)
+        if (not lora_path and not self.lora_path and preset == self.quantization
+                and compute_dtype == self.compute_dtype and self.model is not None):
+            return
+        self.model = self.lm = self.tok = None
+        self.clear_batch()
+        self.heads = None
+        self._hb = self._qkb = self._rjpp_state = None
+        self.resid_p50.clear()
+        self._seen.clear()
+        self._con_cache.clear()
+        self._lens_cache.clear()
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        self.quantization = preset
+        self.compute_dtype = compute_dtype
+        self.lora_path = lora_path or None
+        self.lora_act_scale = None
+        self._lora_cache_id = uuid4().hex if lora_path else None
+        self.set_load_state("loading", "setup")
+        self.ensure_loaded(start=True)
+        path = os.path.join(CACHE, "model_loading.json")
+        with open(path + ".tmp", "w", encoding="utf-8") as f:
+            json.dump({"quantization": preset, "compute_dtype": compute_dtype}, f)
+        os.replace(path + ".tmp", path)
 
     # ---------- loading ----------
-    def ensure_loaded(self):
-        if self.model is not None:
-            return
-        if NO_MODEL:
-            raise RuntimeError("live model disabled (EXPLORER_NO_MODEL)")
+    def ensure_loaded(self, *, start=False):
         with self.lock:
             if self.model is not None:
                 return
-            self.status = "loading"
-            dev = "mps" if torch.backends.mps.is_available() else ("cuda" if torch.cuda.is_available() else "cpu")
-            self.tok = AutoTokenizer.from_pretrained(MODEL)
-            # straight onto the device: loading on cpu and then moving needs two copies of the weights at once
-            if dev == "mps":  # one tensor at a time: transformers' threaded loading can deadlock copying to mps
-                os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
-            m = Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, dtype=torch.bfloat16, device_map=dev).eval()
-            m.model.visual = None  # the vision tower is never used; frees its weights
-            if dev == "mps":
-                torch.mps.empty_cache()
-            self.dev, self.model, self.lm = dev, m, m.model.language_model
-            for i, layer in enumerate(self.lm.layers):
-                layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
-                layer.register_forward_hook(self._resid_hook(i))
-                # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
-                # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
-                if hasattr(layer, "self_attn"):
-                    a = layer.self_attn
-                    a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
-                else:
-                    a = layer.linear_attn
-                    a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
-                a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
-                if hasattr(layer, "linear_attn"):
-                    a.norm.register_forward_pre_hook(self._gnorm_hook(i, a.num_v_heads))
-                layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
-            self.status = "ready"
+            if NO_MODEL:
+                raise RuntimeError("live model disabled (EXPLORER_NO_MODEL)")
+            if self.status == "error":
+                # A hover or status-dependent request must not repeatedly retry an OOM/download failure.
+                # Applying a loading preset explicitly clears this state and retries.
+                raise RuntimeError(self.load_error or "Model loading failed; apply a loading preset to retry.")
+            if not (start or self.load_on_demand):
+                raise ModelLoadRequired("Choose a model loading mode and click Load first.")
+            try:
+                self._load_model()
+            except Exception as exc:
+                self.model = self.lm = None
+                self.set_load_state("error", error=str(exc) or type(exc).__name__)
+                raise
+            self.set_load_state("ready")
+
+    def _load_weights(self, **kwargs):
+        self.set_load_state("loading", "weights")
+        # The locked Transformers release iterates the checkpoint through this progress bar.
+        # Keep its console output, and observe only the loading thread while from_pretrained runs.
+        with _weight_progress_lock:
+            tqdm = getattr(core_model_loading, "tqdm", None)
+            if tqdm is None:
+                return Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, **kwargs)
+            owner = threading.get_ident()
+
+            def report(bar, total):
+                self.set_load_state("loading", "weights", 0, total)
+                for completed, item in enumerate(bar, 1):
+                    yield item
+                    self.set_load_state("loading", "weights", completed, total)
+
+            def track(iterable, *args, **options):
+                bar = tqdm(iterable, *args, **options)
+                if threading.get_ident() == owner and options.get("desc") == "Loading weights":
+                    return report(bar, len(iterable))
+                return bar
+
+            core_model_loading.tqdm = track
+            try:
+                return Qwen3_5ForConditionalGeneration.from_pretrained(MODEL, **kwargs)
+            finally:
+                core_model_loading.tqdm = tqdm
+
+    def _load_model(self):
+        self.set_load_state("loading", "setup")
+        dev = self.device()
+        validate_environment(self.quantization, dev)
+        quant_config = make_quantization_config(self.quantization, self.compute_dtype)
+        self.set_load_state("loading", "tokenizer")
+        self.tok = AutoTokenizer.from_pretrained(MODEL)
+        # straight onto the device: loading on cpu and then moving needs two copies of the weights at once
+        if dev == "mps":  # one tensor at a time: transformers' threaded loading can deadlock copying to mps
+            os.environ.setdefault("HF_DEACTIVATE_ASYNC_LOAD", "1")
+        kwargs = {"dtype": resolve_compute_dtype(self.compute_dtype), "device_map": dev}
+        if quant_config is not None:
+            kwargs["quantization_config"] = quant_config
+        m = self._load_weights(**kwargs).eval()
+        if self.lora_path:
+            from peft import PeftModel
+            self.set_load_state("loading", "lora")
+            adapted = PeftModel.from_pretrained(m, self.lora_path, is_trainable=False, local_files_only=True)
+            m = adapted.merge_and_unload(safe_merge=True).eval()
+        self.set_load_state("loading", "finalizing")
+        prepare_weight_only_model(m, self.quantization, self.compute_dtype)
+        m.model.visual = None  # the vision tower is never used; frees its weights
+        if dev == "mps":
+            torch.mps.empty_cache()
+        self.dev, self.lm = dev, m.model.language_model
+        for i, layer in enumerate(self.lm.layers):
+            layer.mlp.down_proj.register_forward_pre_hook(self._hook(i))
+            layer.register_forward_hook(self._resid_hook(i))
+            layer.register_forward_pre_hook(self._resid_input_hook(i), with_kwargs=True)
+            # attention output projection: its input is the heads side by side (full attention: o_proj, 16 x 256
+            # after the output gate; linear attention: out_proj, 32 value heads x 128 after the gated norm)
+            if hasattr(layer, "self_attn"):
+                a = layer.self_attn
+                a.o_proj.register_forward_pre_hook(self._head_hook(i, a.o_proj.in_features // a.head_dim))
+            else:
+                a = layer.linear_attn
+                a.out_proj.register_forward_pre_hook(self._head_hook(i, a.num_v_heads))
+            a.register_forward_pre_hook(self._qk_hook(i), with_kwargs=True)
+            if hasattr(layer, "linear_attn"):
+                a.norm.register_forward_pre_hook(self._gnorm_hook(i, a.num_v_heads))
+            layer.post_attention_layernorm.register_forward_hook(self._mlp_in_hook(i))
+        self.model = m
 
     def _hook(self, i):
         def hook(mod, inp):
             h = inp[0]
+            batch = [p for p in getattr(self, "_batch_push", ()) if p[0] == i]
+            if batch:
+                h = h.clone()
+                for _, n, mode, value in batch:
+                    if mode == "mul":
+                        h[:, :, n] = h[:, :, n] * value
+                    else:
+                        h[:, :, n] = h[:, :, n] + value
             if self._capture_full is not None:
                 self._capture_full[i] = h[0].float().cpu()  # [tokens, inter]
             if self._capture_all is not None:
@@ -112,9 +303,10 @@ class Runtime:
                 mx, amx = a.max(0)
                 mn, amn = a.min(0)
                 self._capture_all[i] = (mx.cpu(), amx.cpu(), mn.cpu(), amn.cpu())
-            if self._read is not None and self._read[0] == i:
-                n = self._read[1]
-                self._seen["act"] = h[0, :, n].float().cpu()
+            if self._read is not None:
+                neurons, captured = self._read
+                if i in neurons:
+                    captured[i] = h[0, :, neurons[i]].T.float().cpu()
             mine = [p for p in self._push if p[0] == i] if self._push else []
             if mine:
                 h = h.clone()
@@ -125,11 +317,48 @@ class Runtime:
                         h[:, :, n] = h[:, :, n] * vals[:, None].to(h.dtype)
                     else:
                         h[:, :, n] = h[:, :, n] + vals[:, None].to(h.dtype)
+            if mine or batch:
                 return (h,)
         return hook
 
+    def batch_info(self):
+        from copy import deepcopy
+        return deepcopy(self._active_batch)
+
+    def rename_batch(self, batch_id, name):
+        if self._active_batch and self._active_batch["id"] == batch_id:
+            self._active_batch = {**self._active_batch, "name": name}
+
+    def clear_batch(self):
+        self._batch_push = ()
+        self._active_batch = None
+        self.heads = None
+
+    def use_batch(self, batch):
+        """Prepare every value before replacing the active batch; caller holds the model lock."""
+        from copy import deepcopy
+        from datetime import datetime, timezone
+        if (batch["model"] != MODEL or batch["quantization"] != self.quantization
+                or batch.get("compute_dtype", "bfloat16") != self.compute_dtype):
+            raise ValueError("Batch model, weight format or compute precision does not match the loaded model.")
+        self.ensure_loaded()
+        prepared = []
+        for op in batch["operations"]:
+            if not op["enabled"]:
+                continue
+            layer, n, mode, value = (op[k] for k in ("layer", "n", "mode", "dose"))
+            if not 0 <= layer < len(self.lm.layers) or not 0 <= n < self.lm.layers[layer].mlp.down_proj.in_features:
+                raise ValueError("Batch neuron is outside the loaded model's dimensions.")
+            prepared.append((layer, n, mode, self._operation_value(layer, n, mode, value)))
+        active = deepcopy(batch)
+        active["applied_at"] = datetime.now(timezone.utc).isoformat()
+        self._batch_push, self._active_batch = tuple(prepared), active
+        self.heads = None
+
     def _mlp_in_hook(self, i):
         def hook(mod, inp, out):
+            if self._capture_residuals is not None:
+                self._capture_residuals["mid"][i] = inp[0][0].detach().cpu().clone()
             if self._capture_heads is not None:  # the MLP's input after the norm, and the residual's rms per token
                 r = inp[0][0].float()
                 self._capture_heads["x"][i] = out[0].half()
@@ -149,7 +378,7 @@ class Runtime:
             if self._capture_heads is not None:  # each head's write into the residual: |W_O[:, head] . out_head|
                 x = inp[0][0]
                 xv = x.view(x.shape[0], n_heads, -1)
-                W = mod.weight.view(mod.weight.shape[0], n_heads, -1)
+                W = linear_weight(mod).view(mod.out_features, n_heads, -1)
                 self._capture_heads["writes"][i] = torch.einsum("thd,ohd->tho", xv, W).float().norm(dim=-1).cpu()  # [T, H]
                 self._capture_heads["y"][i] = xv.transpose(0, 1).half()  # [H, T, D]: each head's output
             mine = [x for x in self._heads if x[0] == i] if self._heads else []
@@ -290,14 +519,14 @@ class Runtime:
         me = self.lm.layers[layer]
         with torch.inference_mode():
             x, rms = c["x"][layer][pos].float(), c["rms"][layer][pos]
-            wg, wu = me.mlp.gate_proj.weight[n].float(), me.mlp.up_proj.weight[n].float()
+            wg, wu = linear_weight(me.mlp.gate_proj)[n].float(), linear_weight(me.mlp.up_proj)[n].float()
             g, u = wg @ x, wu @ x
             sg = torch.sigmoid(g)
             J = ((sg * (1 + g * (1 - sg))) * u * wg + g * sg * wu) * (1 + me.post_attention_layernorm.weight.float()) / rms
             out, T = [], {}
             for l in range(layer + 1):
                 lay = self.lm.layers[l]
-                W = (lay.self_attn.o_proj if hasattr(lay, "self_attn") else lay.linear_attn.out_proj).weight.float()
+                W = linear_weight(lay.self_attn.o_proj if hasattr(lay, "self_attn") else lay.linear_attn.out_proj).float()
                 y = c["y"][l][:, pos].float()  # [H, D]
                 t = (W.T @ J).view(y.shape)
                 T[l] = t
@@ -351,7 +580,7 @@ class Runtime:
         share for each row, multiplied. Shares make large-norm neurons that line up with every head (hubs) sink. Each
         list is the top k by that share, z-scored over all candidate neurons. q and k: earlier neurons whose down
         column lands in the head's query or key read space, the same way as reads."""
-        key = f"{layer}:{head}:{k}:qk"
+        key = self._weight_cache_key(f"{layer}:{head}:{k}:qk")
         with self._db_lock:
             self._db.execute("CREATE TABLE IF NOT EXISTS headcon (key TEXT PRIMARY KEY, val TEXT)")
             row = self._db.execute("SELECT val FROM headcon WHERE key = ?", (key,)).fetchone()
@@ -365,17 +594,17 @@ class Runtime:
                 a = lay.self_attn; hd = a.head_dim
                 nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
                 kv = head // (nq // nkv)
-                WV = a.v_proj.weight[kv * hd:(kv + 1) * hd].float() * g
-                WO = a.o_proj.weight[:, head * hd:(head + 1) * hd].float()
-                WQ = a.q_proj.weight.view(nq, 2 * hd, -1)[head, :hd].float() * g
-                WK = a.k_proj.weight[kv * hd:(kv + 1) * hd].float() * g
+                WV = linear_weight(a.v_proj)[kv * hd:(kv + 1) * hd].float() * g
+                WO = linear_weight(a.o_proj)[:, head * hd:(head + 1) * hd].float()
+                WQ = linear_weight(a.q_proj).view(nq, 2 * hd, -1)[head, :hd].float() * g
+                WK = linear_weight(a.k_proj)[kv * hd:(kv + 1) * hd].float() * g
             else:
                 a = lay.linear_attn; hd = a.head_v_dim
-                WV = a.in_proj_qkv.weight[2 * a.key_dim + head * hd: 2 * a.key_dim + (head + 1) * hd].float() * g
-                WO = a.out_proj.weight[:, head * hd:(head + 1) * hd].float() * a.norm.weight.float()
+                WV = linear_weight(a.in_proj_qkv)[2 * a.key_dim + head * hd: 2 * a.key_dim + (head + 1) * hd].float() * g
+                WO = linear_weight(a.out_proj)[:, head * hd:(head + 1) * hd].float() * a.norm.weight.float()
                 kh, kd = head // (a.num_v_heads // a.num_k_heads), a.head_k_dim
-                WQ = a.in_proj_qkv.weight[kh * kd:(kh + 1) * kd].float() * g
-                WK = a.in_proj_qkv.weight[a.key_dim + kh * kd:a.key_dim + (kh + 1) * kd].float() * g
+                WQ = linear_weight(a.in_proj_qkv)[kh * kd:(kh + 1) * kd].float() * g
+                WK = linear_weight(a.in_proj_qkv)[a.key_dim + kh * kd:a.key_dim + (kh + 1) * kd].float() * g
             # orthonormal bases of the read and write spaces, so a share is a plain projection length
             QV = torch.linalg.qr(WV.T.cpu())[0].to(WV.device)  # [hidden, hd]
             QO = torch.linalg.qr(WO.cpu())[0].to(WO.device)
@@ -389,7 +618,7 @@ class Runtime:
             QK = torch.linalg.qr(WK.T.cpu())[0].to(WK.device)
             reads, rq, rk, wr = [], [], [], []
             for l in range(layer):
-                D = self.lm.layers[l].mlp.down_proj.weight.float()  # [hidden, N]
+                D = linear_weight(self.lm.layers[l].mlp.down_proj).float()  # [hidden, N]
                 dn = D.norm(dim=0).clamp(min=1e-8)
                 reads.append(((QV.T @ D).norm(dim=0) / dn).cpu())
                 rq.append(((QQ.T @ D).norm(dim=0) / dn).cpu())
@@ -397,7 +626,7 @@ class Runtime:
             for l in range(layer, len(self.lm.layers)):
                 L2 = self.lm.layers[l]
                 w = 1.0 + L2.post_attention_layernorm.weight.float()
-                G, U = L2.mlp.gate_proj.weight.float() * w, L2.mlp.up_proj.weight.float() * w
+                G, U = linear_weight(L2.mlp.gate_proj).float() * w, linear_weight(L2.mlp.up_proj).float() * w
                 share = lambda R: (R @ QO).norm(dim=1) / R.norm(dim=1).clamp(min=1e-8)
                 wr.append((share(G) * share(U)).cpu())
             out = {}
@@ -427,12 +656,14 @@ class Runtime:
                 if hasattr(lay, "self_attn"):
                     a = lay.self_attn; hd = a.head_dim
                     nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
-                    heads = [(a.v_proj.weight[(h // (nq // nkv)) * hd:(h // (nq // nkv) + 1) * hd].float() * g,
-                              a.o_proj.weight[:, h * hd:(h + 1) * hd].float()) for h in range(nq)]
+                    V, O = linear_weight(a.v_proj), linear_weight(a.o_proj)
+                    heads = [(V[(h // (nq // nkv)) * hd:(h // (nq // nkv) + 1) * hd].float() * g,
+                              O[:, h * hd:(h + 1) * hd].float()) for h in range(nq)]
                 else:
                     a = lay.linear_attn; hd = a.head_v_dim; o = 2 * a.key_dim
-                    heads = [(a.in_proj_qkv.weight[o + h * hd:o + (h + 1) * hd].float() * g,
-                              a.out_proj.weight[:, h * hd:(h + 1) * hd].float() * a.norm.weight.float())
+                    V, O = linear_weight(a.in_proj_qkv), linear_weight(a.out_proj)
+                    heads = [(V[o + h * hd:o + (h + 1) * hd].float() * g,
+                              O[:, h * hd:(h + 1) * hd].float() * a.norm.weight.float())
                              for h in range(a.num_v_heads)]
                 for h, (WV, WO) in enumerate(heads):
                     qv.append(torch.linalg.qr(WV.T.cpu())[0]); qo.append(torch.linalg.qr(WO.cpu())[0])
@@ -449,9 +680,9 @@ class Runtime:
         QV, QO, spans = self._head_bases()
         with self.lock, torch.inference_mode():
             me = self.lm.layers[layer]
-            d = me.mlp.down_proj.weight[:, n].float()
+            d = linear_weight(me.mlp.down_proj)[:, n].float()
             w = 1.0 + me.post_attention_layernorm.weight.float()
-            gr, ur = me.mlp.gate_proj.weight[n].float() * w, me.mlp.up_proj.weight[n].float() * w
+            gr, ur = linear_weight(me.mlp.gate_proj)[n].float() * w, linear_weight(me.mlp.up_proj)[n].float() * w
             pr = (QV.T @ d).cpu()  # projections of the down column on every head's read basis
             pg, pu = (QO.T @ gr).cpu(), (QO.T @ ur).cpu()
         dn, gn, un, hid = float(d.norm()), float(gr.norm()), float(ur.norm()), d.shape[0]
@@ -490,15 +721,17 @@ class Runtime:
                         a = lay.self_attn; hd = a.head_dim
                         nq, nkv = a.o_proj.in_features // hd, a.k_proj.out_features // hd
                         if role == "q":
-                            Wq = a.q_proj.weight.view(nq, 2 * hd, -1)[:, :hd]
+                            Wq = linear_weight(a.q_proj).view(nq, 2 * hd, -1)[:, :hd]
                             units = [(Wq[h], [h]) for h in range(nq)]
                         else:
                             rep = nq // nkv
-                            units = [(a.k_proj.weight[kv * hd:(kv + 1) * hd], list(range(kv * rep, (kv + 1) * rep))) for kv in range(nkv)]
+                            K = linear_weight(a.k_proj)
+                            units = [(K[kv * hd:(kv + 1) * hd], list(range(kv * rep, (kv + 1) * rep))) for kv in range(nkv)]
                     else:
                         a = lay.linear_attn; hd = a.head_k_dim; rep = a.num_v_heads // a.num_k_heads
                         o = 0 if role == "q" else a.key_dim
-                        units = [(a.in_proj_qkv.weight[o + kh * hd:o + (kh + 1) * hd], list(range(kh * rep, (kh + 1) * rep)))
+                        QK = linear_weight(a.in_proj_qkv)
+                        units = [(QK[o + kh * hd:o + (kh + 1) * hd], list(range(kh * rep, (kh + 1) * rep)))
                                  for kh in range(a.num_k_heads)]
                     for W, hs in units:
                         cols.append(torch.linalg.qr((W.float() * g).T.cpu())[0].half())
@@ -516,7 +749,7 @@ class Runtime:
         qk = self._qk_bases()
         zs = self.neuron_heads(layer, n)
         with self.lock, torch.inference_mode():
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+            d = linear_weight(self.lm.layers[layer].mlp.down_proj)[:, n].float()
             dn = float(d.norm())
             proj = {r: (B.T @ d.half()).float().cpu() for r, (B, _) in qk.items()}
         roles = {}
@@ -547,10 +780,19 @@ class Runtime:
         L = self.lm.layers[layer]
         return L.self_attn.o_proj.in_features // L.self_attn.head_dim if hasattr(L, "self_attn") else L.linear_attn.num_v_heads
 
+    def _resid_input_hook(self, i):
+        def hook(mod, args, kwargs):
+            if i == 0 and self._capture_residuals is not None:
+                h = kwargs.get("hidden_states", args[0] if args else None)
+                self._capture_residuals["input"] = h[0].detach().cpu().clone()
+        return hook
+
     def _resid_hook(self, i):
         def hook(mod, inp, out):
+            h = out[0] if isinstance(out, tuple) else out
+            if self._capture_residuals is not None:
+                self._capture_residuals["post"][i] = h[0].detach().cpu().clone()
             if self._seen.get("want_resid") == i:
-                h = out[0] if isinstance(out, tuple) else out
                 self._seen["resid"] = h[0, 1:].float().norm(dim=-1).cpu()
         return hook
 
@@ -562,16 +804,22 @@ class Runtime:
             v = float(np.load(path)["resid_norm_q10_50_90"][1])
         else:
             ids = self.tok(REFERENCE_TEXT, return_tensors="pt").input_ids.to(self.dev)
+            # Dose calibration must not depend on a previously active batch or a temporary push.
+            previous_batch, previous_push = self._batch_push, self._push
+            self._batch_push, self._push = (), None
             self._seen["want_resid"] = layer
-            with torch.inference_mode():
-                self.lm(input_ids=ids, use_cache=False)
-            self._seen.pop("want_resid")
-            v = float(self._seen.pop("resid").median())
+            try:
+                with torch.inference_mode():
+                    self.lm(input_ids=ids, use_cache=False)
+                v = float(self._seen.pop("resid").median())
+            finally:
+                self._seen.pop("want_resid", None)
+                self._batch_push, self._push = previous_batch, previous_push
         self.resid_p50[layer] = v
         return v
 
     def down_col(self, layer, n):
-        return self.lm.layers[layer].mlp.down_proj.weight[:, n].float()
+        return linear_weight(self.lm.layers[layer].mlp.down_proj)[:, n].float()
 
     # ---------- steering ----------
     def chat_ids(self, prompt):
@@ -588,19 +836,23 @@ class Runtime:
         yield from self.steer_multi([(layer, n, dose, mode)], rows_messages, max_new, cancel)
 
     def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None, temperature=0.0, repetition_penalty=1.0, seed=0, min_p=0.0):
-        """steer_stream for any number of neurons at once: pushes = [(layer, n, dose, mode)], all applied together.
-        Each is reversed in row 2 the same way a single neuron is (add: -dose; mul: x -dose). Greedy by default; with
+        """Apply pushes = [(layer, n, dose, mode)] together. One conversation uses the given doses. Three rows compare
+        the given doses, the baseline and the reversed doses (add: -dose; mul: x -dose). Greedy by default; with
         temperature > 0 each row samples from its own generator seeded with `seed` (so a run repeats exactly), keeping
         only tokens with at least min_p times the top token's probability.
         repetition_penalty > 1 divides positive logits (multiplies negative ones) of every token already in the row's
         prompt or output, as in transformers."""
+        row_count = len(rows_messages)
+        if row_count not in (1, 3):
+            raise ValueError("Steering requires one conversation or three comparison rows.")
+        row_signs = (1, 0, -1)[:row_count]
         self.ensure_loaded()
         with self.lock:
             if cancel is not None and cancel.is_set():
                 yield None, None
                 return
             try:
-                push = [self._push_entry(layer, n, dose, mode, (1, 0, -1)) for layer, n, dose, mode in pushes]
+                push = [self._push_entry(layer, n, dose, mode, row_signs) for layer, n, dose, mode in pushes]
                 seqs = [self.messages_ids(m) for m in rows_messages]
                 T = max(map(len, seqs))
                 pad = self.tok.pad_token_id if self.tok.pad_token_id is not None else 0
@@ -608,11 +860,11 @@ class Runtime:
                 mask = torch.tensor([[0] * (T - len(q)) + [1] * len(q) for q in seqs], device=self.dev)
                 pos = (mask.cumsum(-1) - 1).clamp(min=0)
                 eos = self.tok.convert_tokens_to_ids("<|im_end|>")
-                done, out_ids, sent = [False] * 3, [[] for _ in range(3)], [""] * 3
-                gens = [torch.Generator().manual_seed(int(seed)) for _ in range(3)]
+                done, out_ids, sent = [False] * row_count, [[] for _ in range(row_count)], [""] * row_count
+                gens = [torch.Generator().manual_seed(int(seed)) for _ in range(row_count)]
                 seen = None
                 if repetition_penalty != 1.0:
-                    seen = torch.zeros(3, self.model.lm_head.out_features, dtype=torch.bool, device=self.dev)
+                    seen = torch.zeros(row_count, self.model.lm_head.out_features, dtype=torch.bool, device=self.dev)
                     for r, q in enumerate(seqs):
                         seen[r, torch.tensor(q, device=self.dev)] = True
                 self._push = push
@@ -632,12 +884,13 @@ class Runtime:
                                 probs = torch.where(probs >= min_p * probs.max(-1, keepdim=True).values, probs, 0.0)
                                 probs = probs / probs.sum(-1, keepdim=True)
                             probs = probs.cpu()
-                            nxt = torch.cat([torch.multinomial(probs[r], 1, generator=gens[r]) for r in range(3)]).to(self.dev)
+                            nxt = torch.cat([torch.multinomial(probs[r], 1, generator=gens[r])
+                                             for r in range(row_count)]).to(self.dev)
                         else:
                             nxt = logits.argmax(-1)
                         if seen is not None:
-                            seen[torch.arange(3, device=self.dev), nxt] = True
-                        for r in range(3):
+                            seen[torch.arange(row_count, device=self.dev), nxt] = True
+                        for r in range(row_count):
                             if done[r]:
                                 continue
                             t = int(nxt[r])
@@ -681,17 +934,27 @@ class Runtime:
         return merged
 
     # ---------- reading ----------
+    def _operation_value(self, layer, n, mode, dose):
+        if mode == "add":
+            norm = float(self.down_col(layer, n).norm())
+            if norm <= 0 or not math.isfinite(norm):
+                raise ValueError("Cannot scale a neuron with a zero or invalid down-projection norm.")
+            dose *= self.layer_resid_p50(layer) / norm
+        if not math.isfinite(dose) or abs(dose) > torch.finfo(resolve_compute_dtype(self.compute_dtype)).max:
+            raise ValueError("Dose exceeds the activation range.")
+        return dose
+
     def _push_entry(self, layer, n, dose, mode, rows):
         """One neuron's push for the down_proj hook, per batch row: rows holds +1 (pushed), 0 (left alone) or -1
         (pushed the other way). add doses are in units of the layer's median residual norm along the neuron's down
         column; mul doses multiply the activation (left alone = x1, the other way = x -dose)."""
         if n is None and mode != "mul":
             raise ValueError("a whole-layer MLP push must be mode 'mul' (e.g. dose 0 to ablate)")
+        value = self._operation_value(layer, n, mode, dose)
         if mode == "mul":
-            vals = [dose if r > 0 else 1.0 if r == 0 else -dose for r in rows]
+            vals = [value if r > 0 else 1.0 if r == 0 else -value for r in rows]
         else:
-            unit = self.layer_resid_p50(layer) / float(self.down_col(layer, n).norm())
-            vals = [r * dose * unit for r in rows]
+            vals = [r * value for r in rows]
         return (layer, n, mode, torch.tensor(vals, device=self.dev))
 
     def read(self, layer, n, text, chat=True, pushes=None, heads=None):
@@ -700,14 +963,23 @@ class Runtime:
         layer's whole MLP, mul only), and attention heads scaled: heads = [(layer, head, scale)], head None = all heads,
         scale 0 = ablated. Only earlier layers can move the read (a same-layer MLP push lands after the capture; a
         same-layer head change lands before it)."""
+        result, = self.read_many([(layer, n)], text, chat, pushes, heads)
+        return {"units": result["units"]}
+
+    def read_many(self, addresses, text, chat=True, pushes=None, heads=None):
+        """Capture the requested neurons from one forward pass, in address order."""
+        neurons, captured = {}, {}
+        for layer, n in addresses:
+            neurons.setdefault(layer, []).append(n)
         self.ensure_loaded()
         with self.lock:
             if chat:
                 ids = self.chat_ids(text)
             else:
                 ids = self.tok(text).input_ids
-            self._read = (layer, n)
-            self._push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
+            push = [self._push_entry(pl, pn, d, m, (1,)) for pl, pn, d, m in pushes or []] or None
+            self._read = (neurons, captured)
+            self._push = push
             self._heads = list(heads) or None if heads else None
             try:
                 with torch.inference_mode():
@@ -716,13 +988,19 @@ class Runtime:
                 self._read = None
                 self._push = None
                 self._heads = None
-            act = self._seen.pop("act").tolist()
-        units = []
-        for text, idx in self.token_units(ids):
-            vals = [act[i] for i in idx]
-            units.append({"text": text, "act": max(vals, key=abs), "pieces": vals})
-        return {"units": units}
+            token_units = self.token_units(ids)
+        activations = {(layer, n): act for layer, ns in neurons.items() for n, act in zip(ns, captured[layer].tolist())}
+        results = []
+        for layer, n in addresses:
+            units = []
+            act = activations[layer, n]
+            for token, idx in token_units:
+                vals = [act[i] for i in idx]
+                units.append({"text": token, "act": max(vals, key=abs), "pieces": vals})
+            results.append({"layer": layer, "n": n, "units": units})
+        return results
 
+    @_locked
     def next_logprobs(self, text, chat=True, prefix="", pushes=None, heads=None):
         """Log-probabilities of the next token after `text` (as a user turn when chat=True, so the next token opens the
         reply) followed by `prefix`, as a [vocab] tensor. With pushes / heads (same units as read()) it also returns
@@ -750,6 +1028,8 @@ class Runtime:
 
     def con_index(self):
         """Precomputed connections (build_connections.py), loaded once."""
+        if self.lora_path:
+            return None
         if self._con_idx is None:
             path = os.path.join(CACHE, "connections.npz")
             if os.path.exists(path):
@@ -762,6 +1042,8 @@ class Runtime:
 
     # ---------- logit lens ----------
     def lens_index(self):
+        if self.lora_path:
+            return None
         if self._lens_idx is None:
             path = os.path.join(CACHE, "lens_index.npz")
             if os.path.exists(path):
@@ -771,6 +1053,8 @@ class Runtime:
 
     def r_index(self):
         """R-lens top tokens for every neuron (explorer/build_rjpp_index.py): up, down [L, N, k] token ids."""
+        if self.lora_path:
+            return None
         if getattr(self, "_r_idx", None) is None:
             path = os.path.join(CACHE, "r_index.npz")
             self._r_idx = dict(np.load(path)) if os.path.exists(path) else False
@@ -778,6 +1062,8 @@ class Runtime:
 
     def s_index(self):
         """S-lens (read side) top tokens for every neuron (explorer/build_s_index.py): up, down [L, N, k] token ids."""
+        if self.lora_path:
+            return None
         if getattr(self, "_s_idx", None) is None:
             path = os.path.join(CACHE, "s_index.npz")
             self._s_idx = dict(np.load(path)) if os.path.exists(path) else False
@@ -785,12 +1071,16 @@ class Runtime:
 
     def jpp_index(self):
         """J++-lens top tokens for every neuron (explorer/build_rjpp_index.py): up, down [L, N, k] token ids."""
+        if self.lora_path:
+            return None
         if getattr(self, "_jpp_idx", None) is None:
             path = os.path.join(CACHE, "jpp_index.npz")
             self._jpp_idx = dict(np.load(path)) if os.path.exists(path) else False
         return self._jpp_idx or None
 
     def steer_index(self):
+        if self.lora_path:
+            return None
         if getattr(self, "_steer_idx", None) is None:
             path = os.path.join(CACHE, "steer_index.npz")
             self._steer_idx = dict(np.load(path)) if os.path.exists(path) else False
@@ -827,7 +1117,7 @@ class Runtime:
 
     # ---------- R / J++ workspace lenses (bubskee/qwen3.5-4b-r-jpp-lenses) ----------
     def rjpp_available(self):
-        return all(os.path.exists(os.path.join(RJPP, f)) for f in ("lenses/r.pt", "lenses/jpp.pt", "excluded_token_ids.json"))
+        return not self.lora_path and all(os.path.exists(os.path.join(RJPP, f)) for f in ("lenses/r.pt", "lenses/jpp.pt", "excluded_token_ids.json"))
 
     def _rjpp(self):
         """The R and J++ transport maps (one FP32 2560x2560 matrix per source block 0..30, memory-mapped), the FP32 final
@@ -882,6 +1172,12 @@ class Runtime:
         return out
 
     # ---------- connections ----------
+    def _connection_tokens(self, connection, ids, negative_ids, vocab=None):
+        connection["lens_ids"], connection["lens_neg_ids"] = ids, negative_ids
+        decode = (lambda token: vocab[token]) if vocab is not None else (lambda token: self.tok.decode([token]))
+        connection["lens"] = [decode(token) for token in ids]
+        connection["lens_neg"] = [decode(token) for token in negative_ids]
+
     def connections(self, layer, n, k=24, lens_k=5):
         """Direct-path weights between neuron (layer, n) and neurons in other layers, ignoring everything between.
         Downstream B in layer j > layer: g = W_gate_j[B] . ((1 + w_j) * d_n), u = W_up_j[B] . (...), where d_n is this
@@ -904,13 +1200,13 @@ class Runtime:
                 v = self.vocab_strings()
                 lg = self.lens_index()
                 for c in out["down"] + out["up"]:
-                    c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
-                    c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
+                    l, m = c["layer"], c["n"]
+                    self._connection_tokens(c, idx["up"][l, m, :lens_k].tolist(), idx["down"][l, m, :lens_k].tolist(), v)
                     if lg is not None and lg is not idx:  # the logit lens too, shown faintly under the steer lens
                         c["logit"] = [v[t] for t in lg["up"][c["layer"], c["n"], :lens_k]]
                         c["logit_neg"] = [v[t] for t in lg["down"][c["layer"], c["n"], :lens_k]]
             return out
-        dkey = f"{layer}:{n}:{k}:{lens_k}"
+        dkey = self._weight_cache_key(f"{layer}:{n}:{k}:{lens_k}" + (":token-ids" if lens_k else ""))
         with self._db_lock:
             row = self._db.execute("SELECT val FROM con WHERE key = ?", (dkey,)).fetchone()
         if row:
@@ -921,20 +1217,20 @@ class Runtime:
         with self.lock, torch.inference_mode():
             dt = self.model.dtype
             out = {"down": [], "up": []}
-            d = self.lm.layers[layer].mlp.down_proj.weight[:, n]
+            d = linear_weight(self.lm.layers[layer].mlp.down_proj)[:, n]
             me = self.lm.layers[layer]
             scale_me = (1.0 + me.post_attention_layernorm.weight.float()).to(dt)
-            r_g = me.mlp.gate_proj.weight[n] * scale_me
-            r_u = me.mlp.up_proj.weight[n] * scale_me
+            r_g = linear_weight(me.mlp.gate_proj)[n] * scale_me
+            r_u = linear_weight(me.mlp.up_proj)[n] * scale_me
             for j, Lyr in enumerate(self.lm.layers):
                 if j == layer:
                     continue
                 if j > layer:
                     v = d * (1.0 + Lyr.post_attention_layernorm.weight.float()).to(dt)
-                    g, u = (Lyr.mlp.gate_proj.weight @ v).float(), (Lyr.mlp.up_proj.weight @ v).float()
+                    g, u = (linear_weight(Lyr.mlp.gate_proj) @ v).float(), (linear_weight(Lyr.mlp.up_proj) @ v).float()
                     side = "down"
                 else:
-                    W = Lyr.mlp.down_proj.weight
+                    W = linear_weight(Lyr.mlp.down_proj)
                     g, u = (r_g @ W).float(), (r_u @ W).float()
                     side = "up"
                 prod = g * u
@@ -950,15 +1246,14 @@ class Runtime:
             if every and lens_k and idx is not None and lens_k <= idx["up"].shape[-1]:
                 v = self.vocab_strings()
                 for c in every:
-                    c["lens"] = [v[t] for t in idx["up"][c["layer"], c["n"], :lens_k]]
-                    c["lens_neg"] = [v[t] for t in idx["down"][c["layer"], c["n"], :lens_k]]
+                    l, m = c["layer"], c["n"]
+                    self._connection_tokens(c, idx["up"][l, m, :lens_k].tolist(), idx["down"][l, m, :lens_k].tolist(), v)
             elif every and lens_k:
-                D = torch.stack([self.lm.layers[c["layer"]].mlp.down_proj.weight[:, c["n"]] for c in every])
+                D = torch.stack([linear_weight(self.lm.layers[c["layer"]].mlp.down_proj)[:, c["n"]] for c in every])
                 logits = self.model.lm_head(self.lm.norm(D[:, None]))[:, 0].float()
                 ids, ids_neg = logits.topk(lens_k).indices.tolist(), (-logits).topk(lens_k).indices.tolist()
                 for c, row, row_neg in zip(every, ids, ids_neg):
-                    c["lens"] = [self.tok.decode([t]) for t in row]
-                    c["lens_neg"] = [self.tok.decode([t]) for t in row_neg]
+                    self._connection_tokens(c, row, row_neg)
         if len(self._con_cache) > 2000:
             self._con_cache.clear()
         self._con_cache[key] = out
@@ -976,16 +1271,15 @@ class Runtime:
         up = np.zeros((L, N, k), np.int32)
         down = np.zeros((L, N, k), np.int32)
         for li, layer in enumerate(self.lm.layers):
-            self.status = f"indexing lens {li}/{L}"
+            self.set_load_state(f"indexing lens {li}/{L}", "lens", li, L)
             with self.lock, torch.inference_mode():
-                W = layer.mlp.down_proj.weight  # [hidden, inter]
+                W = linear_weight(layer.mlp.down_proj)  # [hidden, inter]
                 for s in range(0, N, chunk):
                     D = W[:, s:s + chunk].T[:, None]  # [c, 1, hidden]
                     logits = self.model.lm_head(self.lm.norm(D))[:, 0]
                     up[li, s:s + chunk] = logits.topk(k).indices.cpu().numpy()
                     down[li, s:s + chunk] = (-logits).topk(k).indices.cpu().numpy()
         np.savez(path, up=up, down=down)
-        self.status = "ready"
         return path
 
     def vocab_strings(self):
@@ -994,6 +1288,8 @@ class Runtime:
             if os.path.exists(path):
                 self._vocab = json.load(open(path))
             else:
+                if self.tok is None and not NO_MODEL and not self.load_on_demand:
+                    self.ensure_loaded()
                 if self.tok is None:
                     self.tok = AutoTokenizer.from_pretrained(MODEL)
                 self._vocab = [self.tok.decode([i]) for i in range(len(self.tok))]
@@ -1042,41 +1338,62 @@ class Runtime:
             finally:
                 self._capture_all, self._capture_from = None, 0
 
-    def build_act_scale(self, path, tokens=10000, seq=512, seed=0):
-        """Each neuron's largest positive and most negative activation over web text (positions >= 1)."""
-        from datasets import load_dataset
+    def build_act_scale(self, path=None, tokens=10000, seq=512, seed=0, *, texts=None):
+        """Measure each neuron's positive and negative extremes, skipping the first token of each chunk."""
         self.ensure_loaded()
-        L, N = len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features
-        pos, neg = np.zeros((L, N), np.float32), np.zeros((L, N), np.float32)
-        buf, seen = [], 0
-        for d in load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True).shuffle(seed=seed):
-            buf += self.tok(d["text"], add_special_tokens=False).input_ids + [self.tok.eos_token_id]
-            while len(buf) >= seq and seen < tokens:
-                chunk, buf = buf[:seq], buf[seq:]
-                self.status = f"measuring neuron ranges {seen // 1000}k/{tokens // 1000}k tokens"
-                acts = self.all_activations(chunk, skip_first=True)
-                for l, (mx, _, mn, _) in acts.items():
-                    pos[l] = np.maximum(pos[l], mx.numpy()); neg[l] = np.minimum(neg[l], mn.numpy())
-                seen += seq
-            if seen >= tokens:
-                break
-        np.savez(path, pos=pos, neg=neg, tokens=seen)
-        self.status = "ready"
-        return path
+        local_texts = texts is not None
+        if not local_texts:
+            from datasets import load_dataset
+            dataset = load_dataset("HuggingFaceFW/fineweb-edu", "sample-10BT", split="train", streaming=True)
+            texts = (row["text"] for row in dataset.shuffle(seed=seed))
 
-    def full_activations(self, ids, heads=False):
+        def token_ids():
+            for text in texts:
+                yield from self.tok(text, add_special_tokens=False).input_ids
+                yield self.tok.eos_token_id
+
+        ids = token_ids()
+        if local_texts:
+            sample = list(islice(ids, tokens))
+            tokens, ids = len(sample), iter(sample)
+        shape = (len(self.lm.layers), self.lm.layers[0].mlp.down_proj.in_features)
+        pos, neg = np.zeros(shape, np.float32), np.zeros(shape, np.float32)
+        seen = 0
+        while seen < tokens:
+            chunk = list(islice(ids, min(seq, tokens - seen)))
+            if len(chunk) < 2:
+                break
+            self.set_load_state("loading", "ranges", seen, tokens)
+            for l, (mx, _, mn, _) in self.all_activations(chunk, skip_first=True).items():
+                pos[l] = np.maximum(pos[l], mx.numpy())
+                neg[l] = np.minimum(neg[l], mn.numpy())
+            seen += len(chunk)
+        if not seen:
+            raise ValueError("Activation calibration needs at least two tokens.")
+        scale = {"pos": pos, "neg": neg, "tokens": seen}
+        if path is not None:
+            np.savez(path, **scale)
+            return path
+        return scale
+
+    def full_activations(self, ids, heads=False, residuals=False):
         """Every neuron's activation at every token: float32 array [layers, tokens, inter]. With heads, the same pass
         also keeps what head_row() needs and every head's write size per token (self.heads)."""
         self.ensure_loaded()
         with self.lock, torch.inference_mode():
             self._capture_full = {}
+            if residuals:
+                self._capture_residuals = {"mid": {}, "post": {}, "model_key": self._weight_cache_key("residual"),
+                                           "batch": self.batch_info()}
             if heads:
                 self._capture_heads = {"q": {}, "writes": {}, "y": {}, "s": {}, "x": {}, "rms": {}}
             try:
                 self.lm(input_ids=torch.tensor([ids], device=self.dev), use_cache=False)
                 if heads:
                     self.heads = {"T": len(ids), "ids": list(ids), **self._capture_heads}
-                return torch.stack([self._capture_full[l] for l in sorted(self._capture_full)]).numpy()
+                acts = torch.stack([self._capture_full[l] for l in sorted(self._capture_full)]).numpy()
+                return (acts, self._capture_residuals) if residuals else acts
             finally:
                 self._capture_full = None
                 self._capture_heads = None
+                self._capture_residuals = None

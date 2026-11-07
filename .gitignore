@@ -1,6 +1,40 @@
 .venv/
+.offline-check/
+offline-cache/
+models/
+dist/
+.env
+.env.*
+!.env.example
+.aws/
+.codex/
+.agents/
+.claude/
+.netrc
+.pypirc
+auth.json
+credentials.json
+*.log
+*.pem
+*.key
+*.p12
+*.pfx
+*.safetensors
+*.gguf
+*.ckpt
+*.pth
+*.pt
+*.bin
+*.whl
+*.egg-info/
+.pytest_cache/
+.coverage*
+htmlcov/
 __pycache__/
+*.py[cod]
 .DS_Store
+Thumbs.db
+Desktop.ini
 
 # sweep data and derived files
 runs/
@@ -24,9 +58,11 @@ sweep/pod_template.json
 
 # rebuilt on first use
 explorer/cache/head_profiles.json
+explorer/cache/head_profiles_*.json
+explorer/cache/model_loading.json*
+explorer/cache/neuron_batches.json*
 
-# experiment scripts
-scripts/
+# Local outputs are private; the upstream scripts themselves remain publishable.
 
 # R / J++ lens release (downloaded)
 explorer/cache/rjpp/

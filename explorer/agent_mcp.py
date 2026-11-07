@@ -253,7 +253,7 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {
          "id": {"type": "string"}, "output": {"type": "string", "description": "the steered output, verbatim"},
          "prompt": {"type": "string"}, "result": {"type": "string", "enum": ["yes", "partial", "no"], "default": "yes"},
-         "setup": {"type": "string", "description": "default: bf16 transformers (neuron explorer), greedy"},
+         "setup": {"type": "string", "description": "default: current BF16/FP16 compute precision and weight format, transformers (neuron explorer), greedy"},
          "note": {"type": "string", "description": "dose changes, caveats, what it took to reproduce"}},
                      "required": ["id", "output"]}},
     {"name": "neuronary_vote", "description": "Vote on a neuronary recipe as the person (1, -1, or 0 to clear). Only when "
@@ -529,8 +529,13 @@ def call(name, a):
     if name == "neuronary_comment":
         return neuronary("POST", f"/recipes/{a['id']}/comments", {"body": a["body"], "parent_id": a.get("parent_id")})
     if name == "neuronary_reproduce":
+        setup = a.get("setup")
+        if not setup:
+            loading = get("/api/model/loading")
+            precision = "fp16" if loading.get("compute_dtype") == "float16" else "bf16"
+            setup = f"{precision} transformers (neuron explorer), greedy; weights={loading['quantization']}"
         body = {"output": a["output"], "result": a.get("result", "yes"),
-                "setup": a.get("setup") or "bf16 transformers (neuron explorer), greedy"}
+                "setup": setup}
         body.update({k: a[k] for k in ("prompt", "note") if a.get(k)})
         return neuronary("POST", f"/recipes/{a['id']}/reproductions", body)
     if name == "neuronary_vote":

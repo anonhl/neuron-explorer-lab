@@ -1,78 +1,81 @@
-# neuron explorer
+# Neuron Explorer Lab
 
-Steering-first neuron explorer for Qwen3.5-4B. Every MLP neuron in a layer is pushed up and down on a few prompts, every
-rollout is kept, and the explorer lays the results out over a 3D view of the model.
+**English** | [简体中文](README.zh-CN.md)
 
-![neuron explorer](explorer.png)
+A Windows-focused workbench for Qwen3.5-4B neuron and residual-stream experiments. This independently maintained fork of [lyramakesmusic/neuron-explorer](https://github.com/lyramakesmusic/neuron-explorer) adds reusable interventions, multi-text comparisons, flexible model loading and local LoRA analysis.
 
-## Explorer
+[Repository](https://github.com/anonhl/neuron-explorer-lab) · [Documentation](docs/README.md) · [Changes](CHANGELOG.md) · [Contributing](CONTRIBUTING.md)
 
-    uv sync
-    uv run python explorer/server.py        # http://localhost:8791
+![Neuron explorer](explorer.png)
 
-Reads sweep runs from `runs/` and per-layer stats from `stats/`, both produced by the sweep below; the caches in
-`explorer/cache/` ship with the repo. Loads Qwen3.5-4B locally (MPS, CUDA or CPU) for live
-steered chat, lens, connections and live inference over your own text.
+## What this fork adds
 
-The R and J++ lens rows read the maps of [bubskee/qwen3.5-4b-r-jpp-lenses](https://huggingface.co/bubskee/qwen3.5-4b-r-jpp-lenses)
-(Apache-2.0):
+- **Residual experiments:** add a direction, remove a write, erase a projection or patch a state at a chosen layer, stage and token position; rerun the model to compare behavior.
+- **Multi-text comparisons:** up to eight independent inputs; compare generation, next-token probabilities, KL divergence, target-continuation scores and activations; export JSON.
+- **Reusable neuron batches:** save named groups of ordered operations with model/precision metadata; activate, replace or stop a batch.
+- **Model-loading choices:** BF16/FP16, bitsandbytes/HQQ weight quantization, and optional local LoRA with full weights.
+- **Local use and teaching:** Windows/offline guides, bundled Three.js, frequency inspection and a standalone simulated HTML demo.
 
-    hf download bubskee/qwen3.5-4b-r-jpp-lenses --local-dir explorer/cache/rjpp
+The 3D explorer, language switching, basic neuron steering, three-column chat, original research and sweep pipeline originate upstream. This fork is not an official upstream release.
 
-- **map**: the model's layers in perspective, attention and MLP per layer, one point per neuron. Hover shows a neuron's
-  steer lens and R lens; click opens it; click a layer's label to view its sheet face-on. `writes` places
-  neurons with similar down-projection columns next to each other.
-- **list**: units ranked by word-cluster mass against random-direction controls; `lens` searches the steer, R and logit
-  lenses for a token, `fires` runs your text through the model and filters neurons by activation.
-- **neuron**: steered rollouts per prompt and dose, a three-column multi-turn steered chat (−, 0, +), lens and
-  connections, a name, and where it fires on web text: its strongest FineFineWeb contexts per sign, each token shaded
-  by the neuron's activation, and the domains it concentrates in.
-- **embeddings**: UMAP of a layer's rollouts, coloured by neuron, prompt, dose or kind.
-- **language**: the interface follows the browser language on first visit; the menu at the right of the header
-  switches between English and Simplified Chinese (the choice is kept in this browser). Translations live in
-  `explorer/static/i18n.js`.
-- **Claude** (fourth neuron-panel tab, or the right-edge handle): a chat running the `claude` CLI (installed and
-  logged in) with the explorer as an MCP server (`explorer/agent_mcp.py`). It reads neurons, cones and lenses, runs the
-  live model (steering, activations, next-token logprobs, ablations), moves the map, list and highlights, and has file
-  tools and a shell in your home folder. Its prompt is `explorer/agent_prompt.md` plus `explorer/agent_methodology.md`, and
-  `explorer/agent_prompt.local.md` when present (untracked, for your own additions);
-  `EXPLORER_CLAUDE_MODEL` picks the model. The server answers only pages and tools on this machine.
+## Inspiration for residual interventions
 
-## Sweep
+One inspiration is research on **sodium oligomannate (GV-971, 甘露特钠)** and indirect regulation through the gut–brain axis. The design analogy treats the residual stream as a shared information environment: changing upstream writes can change what downstream neurons receive and how the model behaves. This is a conceptual inspiration, not an equivalence between biological and model mechanisms. [Original study](https://www.nature.com/articles/s41422-019-0216-x)
 
-Runs on a CUDA 13 GPU pod with the steering fork of vLLM ([RhizoNymph/vllm](https://github.com/RhizoNymph/vllm)).
+## Start here
 
-    bash sweep/setup_pod.sh                                   # fork, deps, model; writes /workspace/env.sh
-    python sweep/neuron_stats.py --layers 22 --tokens 2000000 --out stats/q35-4b
-    python sweep/steer_sweep.py --stats stats/q35-4b_L22.npz --design main_rel --dose-unit rel \
-        --neurons all --random-controls 256 --run q35-4b-L22
-    sweep/run_depth.sh "4 9 13 17" 384 64                     # random-subset sweep across several layers
-
-`main_rel` doses are fractions of the median residual norm leaving the layer: {who, snake, orange} × {−0.7, +0.5, +0.8}
-and {free} × {+3}, plus one unsteered baseline per prompt.
-
-| script | output |
+| Goal | Guide |
 |---|---|
-| `sweep/neuron_stats.py` | per-neuron activation extremes by sign regime, down columns, residual norms |
-| `sweep/steer_sweep.py` | `runs/<run>.jsonl`: text, token ids, logprobs, top-k per step; optional activation captures |
-| `sweep/rank.py` | `runs/<run>.units.jsonl`: distinctive words, cluster mass, percentile against controls |
-| `sweep/steer_lens.py` | `stats/steer_lens_L{l}.npz`: next-token Δlogprob and KL for ±0.8 pushes on every neuron |
-| `sweep/depth_report.py` | `runs/depth_report.json`: per-layer share of neurons above controls, coherence, top units |
-| `sweep/shift.py` | word-shift score against controls, all words counted |
-| `sweep/merge_runs.py` | joins sharded runs of one layer |
-| `sweep/check_equivalence.py` | HF vs vLLM steering and capture agreement |
-| `sweep/bench.py`, `sweep/peek.py` | throughput conditions; terminal views of a run |
-| `explorer/build_embeddings.py` | `runs/<run>.umap.json` |
-| `explorer/build_layout.py` | `explorer/cache/layout_writes.npz` |
-| `explorer/build_connections.py` | `explorer/cache/connections.npz`: each neuron's 24 strongest direct-path links up and down |
-| `sweep/fit_input_lens.py` | `S.pt`: the fitted input map S_L (token embeddings to the residual each MLP reads, layers 0–31), RelP rules of safety-research/jpp_lens; shards over prompts, merged by `num_prompts`; copy to `explorer/cache/slens/S.pt` |
-| `explorer/build_s_index.py` | `explorer/cache/s_index.npz`: each neuron's top S-lens (read side) tokens, both poles |
-| `explorer/build_rjpp_index.py` | `explorer/cache/r_index.npz`, `jpp_index.npz`: each neuron's top R- and J++-lens tokens, both poles (needs the R/J++ release in `explorer/cache/rjpp/`) |
-| `sweep/finefineweb.py` | `<out>/corpus.npz`, `urls.json`, `acts.npz`: a domain-balanced FineFineWeb sample (about 20M tokens over 66 domains) and every neuron's top contexts per sign and per-domain activation statistics; copy the three files to `explorer/cache/ffw/` |
-| `sweep/capture_prefill.py` | `captures/<run>.mlp_in.npy`: MLP input at the last prompt token at the run's capture layers, steered |
+| Try the UI without a model | Open `neuron-explorer-demo.html`; all values and replies are simulated |
+| Install and launch on Windows | [Windows startup](docs/START_WINDOWS.md) |
+| Prepare a fully offline machine | [Offline Windows guide](docs/OFFLINE_WINDOWS.md) |
+| Use batches and residual experiments | [Experiment guide](docs/EXPERIMENTS.md) |
+| Develop or prepare a release | [Contributing](CONTRIBUTING.md), [Releasing](docs/RELEASING.md) |
+| See actual verification status | [Release checks](docs/RELEASE_CHECKS.md) |
 
-`research_log.md` holds the findings and reasoning; `NOTES.md` the source notes.
+Use **64-bit Python 3.12** for the documented setup (declared minimum: 3.11), uv, and a modern WebGL/import-map browser. Quantized loading requires NVIDIA CUDA; CPU/MPS use full weights. The inherited sweep scripts still target Linux/CUDA.
+
+From the project root in PowerShell:
+
+```powershell
+uv sync --locked --python 3.12
+# Optional: select the dependencies you need.
+uv sync --locked --python 3.12 --extra quantization
+uv sync --locked --python 3.12 --extra lora
+# To keep both installed, put both --extra flags on the same command.
+```
+
+Weights are not distributed with the source. Follow the [startup guide](docs/START_WINDOWS.md) to download the model into `models/Qwen3.5-4B/Qwen3.5-4B`, then launch:
+
+```powershell
+$env:PYTHONUTF8 = "1"
+$env:HF_HUB_OFFLINE = "1"
+$env:EXPLORER_MODEL = "models/Qwen3.5-4B/Qwen3.5-4B"
+Remove-Item Env:EXPLORER_NO_MODEL -ErrorAction SilentlyContinue
+.\.venv\Scripts\python.exe explorer\server.py
+```
+
+Open [localhost:8791](http://127.0.0.1:8791/). Select a weight format and click **Load**; the server loads weights only after that action. For cache-only browsing, download the model config and set `EXPLORER_NO_MODEL="1"` as described in the guide.
+
+## Loading and analysis
+
+The dialog offers full BF16/FP16, bitsandbytes INT8/NF4/FP4 (including 4-bit double quantization), and HQQ 8/4/3/2/1-bit presets. Only selected linear weights are quantized; activations remain BF16/FP16. INT8 temporarily unpacks weights for floating-point multiplication, so smaller storage does not guarantee faster inference or a particular peak-memory footprint. Successful precision/preset choices are saved locally.
+
+For LoRA, install `--extra lora`, select **Full weights**, and supply a local directory containing `adapter_config.json` and `adapter_model.safetensors`. Use a compatible base model. The adapter is merged in memory and activation calibration is session-specific; source weight files are not rewritten. LoRA is not combined with quantized loading in this app.
+
+The explorer retains the upstream map, ranked units, lens/token search, live activations, steered chat, connections, rollout embeddings and optional agents. Historical rollouts, FFW contexts and raw R/J++ lens maps need additional data. The nine bundled reference caches are [verified against upstream](docs/upstream-cache-provenance.json).
+
+## Limits and verification
+
+- Quantization, FP16 and adapters can change results. Historical sweeps and indices describe the reference model; some original lens/connection features are restricted with LoRA.
+- Local residual readouts are estimates. Causal experiments rerun baseline and intervention separately with fresh generation caches.
+- Long activation captures use substantial host memory; weight quantization does not remove that cost. Start with short inputs.
+- Optional Claude/Codex agents need separately installed/authenticated CLIs, may use online services and can access local files/commands. They are separate from offline Qwen inference. The server is for trusted single-user localhost use.
+
+## Upstream research
+
+The [original README](https://github.com/lyramakesmusic/neuron-explorer#readme), [research log](research_log.md) and [source notes](NOTES.md) document the upstream research and CUDA/vLLM sweep process. Original research records and executable agent prompts retain their English source text. Maintained English/Chinese guides are listed in the [documentation index](docs/README.md).
 
 ## License
 
-MIT, see [LICENSE](LICENSE).
+Code is distributed under [MIT](LICENSE), retaining the original author's copyright. Models, datasets and bundled dependencies retain their own terms; see [third-party notices](THIRD_PARTY_NOTICES.md). Source releases exclude weights, private adapters, personal configuration, chats and web corpora.

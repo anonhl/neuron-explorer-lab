@@ -1,0 +1,9 @@
+# Stable source/demo line endings across Windows and Unix checkouts.
+* text=auto eol=lf
+*.npz -text
+*.npy -text
+*.png -text
+*.sqlite -text
+*.zip -text
+# Preserve the npm distribution byte-for-byte, including third-party resources.
+explorer/static/vendor/** -text

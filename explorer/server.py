@@ -7,21 +7,29 @@ import builtins
 import glob
 import json
 import os
+import re
 import sys
 import threading
+from uuid import uuid4
+from functools import lru_cache
 
 import numpy as np
 import uvicorn
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Query, Request
 from fastapi.responses import PlainTextResponse, FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from transformers import AutoConfig
+from pydantic import BaseModel
+from transformers import AutoConfig, AutoTokenizer
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, os.path.join(ROOT, "sweep"))
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from rank import compute_units  # noqa: E402
-from runtime import CACHE, MODEL, NO_MODEL, Runtime  # noqa: E402
+from runtime import CACHE, MODEL, NO_MODEL, ModelLoadRequired, Runtime  # noqa: E402
+from quantization import COMPUTE_DTYPES, FORMATS, resolve_compute_dtype, weight_format  # noqa: E402
+from neuron_batches import BatchStore, validate_operations  # noqa: E402
+from residuals import inspect_residual, residual_rows  # noqa: E402
+from residual_interventions import validate_experiment, tokenize_texts, run_experiment  # noqa: E402
 
 RUNS, STATS = os.path.join(ROOT, "runs"), os.path.join(ROOT, "stats")
 # the agent's neuronary.org tools (agent_mcp.py) read the person's token from here when set
@@ -35,6 +43,30 @@ ARCH = {"n_layers": _cfg.num_hidden_layers, "hidden": _cfg.hidden_size, "inter":
         "linear_v_heads": _cfg.linear_num_value_heads}
 
 app = FastAPI()
+_model_switching = False
+_active_api_requests = 0
+
+
+@app.exception_handler(ModelLoadRequired)
+async def model_load_required(_request, exc):
+    return JSONResponse({"error": str(exc)}, status_code=409)
+
+
+@app.middleware("http")
+async def model_loading_guard(request, call_next):
+    """Do not mix captures while changing weights or compute precision."""
+    global _active_api_requests
+    tracked = request.url.path.startswith("/api/") and request.url.path not in (
+        "/api/model/loading", "/api/status", "/api/index")
+    if tracked and _model_switching:
+        return JSONResponse({"error": "Model weights are being reloaded; please wait."}, status_code=409)
+    if tracked:
+        _active_api_requests += 1
+    try:
+        return await call_next(request)
+    finally:
+        if tracked:
+            _active_api_requests -= 1
 
 
 # only this machine's own pages and tools: a page on another site (or a DNS name rebound to 127.0.0.1) can't reach
@@ -62,7 +94,9 @@ async def no_store(request, call_next):
         resp.headers["Cache-Control"] = "no-store"
     return resp
 
-rt = Runtime(STATS)
+rt = Runtime(STATS, load_on_demand=False)
+batches = BatchStore(os.path.join(CACHE, "neuron_batches.json"))
+MODEL_REVISION = getattr(_cfg, "_commit_hash", None)
 _cache = {}
 
 
@@ -149,8 +183,10 @@ def names():
 @app.get("/api/index")
 def index():
     runs = layer_runs()
+    loading = rt.loading_info()
     return {"model": MODEL, "arch": ARCH,
-            "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())}, "status": rt.status}
+            "layers": {str(l): os.path.basename(p) for l, p in sorted(runs.items())},
+            "status": loading["status"], "loading": loading}
 
 
 @app.get("/api/units")
@@ -235,6 +271,25 @@ async def hover(layer: int, n: int):
             "r": lens.get("r_up"), "r_neg": lens.get("r_down"), "con": con}
 
 
+@lru_cache(maxsize=1)
+def local_tokenizer():
+    try:
+        return AutoTokenizer.from_pretrained(MODEL, local_files_only=True)
+    except (OSError, ValueError, TypeError):
+        return None
+
+
+@app.get("/api/word-tokens")
+def word_tokens(word: str = Query(min_length=1, max_length=512)):
+    tokenizer = rt.tok
+    if tokenizer is None:
+        tokenizer = local_tokenizer()
+    if tokenizer is None:
+        return {"ids": None}
+    ids = {token for form in (word, " " + word) for token in tokenizer.encode(form, add_special_tokens=False)}
+    return {"ids": sorted(ids)}
+
+
 @app.get("/api/lens")
 async def lens(layer: int, n: int):
     return await asyncio.to_thread(rt.lens, layer, n, 12)
@@ -253,25 +308,48 @@ async def lens_rjpp(layer: int, n: int):
 @app.post("/api/reads")
 async def reads(req: Request):
     b = await req.json()
+    if "neurons" in b:
+        neurons = b["neurons"]
+        if (not isinstance(neurons, list) or not 1 <= len(neurons) <= 1000
+                or any(not isinstance(item, dict) or type(item.get("layer")) is not int or type(item.get("n")) is not int
+                       or not 0 <= item["layer"] < ARCH["n_layers"] or not 0 <= item["n"] < ARCH["inter"] for item in neurons)):
+            return JSONResponse({"error": "Invalid neuron addresses."}, status_code=400)
+        addresses = list(dict.fromkeys((item["layer"], item["n"]) for item in neurons))
+        return {"results": await asyncio.to_thread(rt.read_many, addresses, b["text"], b.get("chat", True))}
     return await asyncio.to_thread(rt.read, int(b["layer"]), int(b["n"]), b["text"], b.get("chat", True))
 
 
 @app.post("/api/steer")
 async def steer(req: Request):
     b = await req.json()
+    try:
+        if not isinstance(b, dict):
+            raise ValueError("Chat request must be an object.")
+        group = b.get("group")
+        if group not in (None, "evaluation", "conversation"):
+            raise ValueError("Unknown chat group.")
+        raw_operations = b["operations"] if "operations" in b else [{
+            "layer": int(b["layer"]), "n": int(b["n"]), "dose": float(b["dose"]), "mode": b.get("mode", "add"),
+        }]
+        operations = [] if group == "conversation" and raw_operations == [] else validate_operations(
+            raw_operations, ARCH["n_layers"], ARCH["inter"])
+        if group == "evaluation" and any(op["dose"] < 0 for op in operations if op["enabled"]):
+            raise ValueError("Evaluation doses must be non-negative.")
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    pushes = [(op["layer"], op["n"], op["dose"], op["mode"]) for op in operations if op["enabled"]]
     loop, q, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
 
     def work():
         try:
             # each row replays its own earlier replies; the user turns are shared
             rows = []
-            for r in range(3):
+            for r in range(1 if group == "conversation" else 3):
                 msgs = []
                 for turn in b.get("history", []):
                     msgs += [{"role": "user", "content": turn["user"]}, {"role": "assistant", "content": turn["replies"][r]}]
                 rows.append(msgs + [{"role": "user", "content": b["prompt"]}])
-            for row, delta in rt.steer_stream(int(b["layer"]), int(b["n"]), rows, float(b["dose"]),
-                                              b.get("mode", "add"), int(b.get("max_new", 300)), cancel):
+            for row, delta in rt.steer_multi(pushes, rows, int(b.get("max_new", 300)), cancel):
                 loop.call_soon_threadsafe(q.put_nowait, {"row": row, "t": delta})
         except Exception as e:  # surfaced in the UI next to the chat
             loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
@@ -299,6 +377,8 @@ _lens = {}
 
 
 def lens_index():
+    if rt.lora_path:
+        return None
     if "up" not in _lens and os.path.exists(LENS_INDEX):
         z = np.load(LENS_INDEX)
         _lens["up"], _lens["down"] = z["up"], z["down"]
@@ -356,16 +436,29 @@ async def search(q: str, limit: int = 300):
 
 
 ACT_SCALE = os.path.join(ROOT, "explorer", "cache", "act_scale.npz")
+LORA_CALIBRATION_TEXT = os.path.join(ROOT, "explorer", "calibration.txt")
 MAX_INFER_TOKENS = 1024  # [32, T, 9216] float32 activations plus scores: about 2.4 GB at this length
+_act = {}
+
+
+def active_act_scale():
+    if rt.lora_path:
+        return rt.lora_act_scale
+    if "pos" not in _act and os.path.exists(ACT_SCALE):
+        with np.load(ACT_SCALE) as scale:
+            _act.update(pos=scale["pos"], neg=scale["neg"], tokens=int(scale["tokens"]))
+    return _act or None
 
 
 @app.get("/api/fires")
 async def fires(text: str, limit: int = 300, chat: bool = False):
     """Neurons that fire hardest on `text` relative to their typical range over web text (activation / typical max,
     and activation / typical min for the negative side)."""
-    if not os.path.exists(ACT_SCALE):
+    calibrated = rt.lora_act_scale is not None if rt.lora_path else os.path.exists(ACT_SCALE)
+    if not calibrated:
         return {"ready": False, "results": []}
-    sc = np.load(ACT_SCALE)
+    await asyncio.to_thread(rt.ensure_loaded)
+    sc = active_act_scale()
     ids = await asyncio.to_thread(rt.chat_ids if chat else (lambda t: rt.tok(t).input_ids), text)
     acts = await asyncio.to_thread(rt.all_activations, ids)
     toks = [rt.tok.decode([t]) for t in ids]
@@ -390,80 +483,186 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
 _infer = {}
 
 
-async def score_text(text, chat=False, heads=False):
+@app.post("/api/residual/tokens")
+async def residual_tokens(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("Experiment must be an object.")
+        checked = validate_experiment({**body, "plan": {"layer": 0, "stage": "post", "method": "add",
+            "direction": "neuron", "scope": "last", "strength": 0}}, ARCH["n_layers"], ARCH["hidden"], ARCH["inter"])
+        def work():
+            with rt.lock:
+                rt.ensure_loaded()
+                rows = tokenize_texts(rt, checked["texts"], checked.get("chat", False))
+                return {"texts": [{k: v for k, v in row.items() if k != "ids"} | {"count": len(row["ids"])} for row in rows],
+                        "model_key": rt._weight_cache_key("residual")}
+        return await asyncio.to_thread(work)
+    except (TypeError, KeyError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
+@app.post("/api/residual/experiment")
+async def residual_experiment(req: Request):
+    try:
+        body = validate_experiment(await req.json(), ARCH["n_layers"], ARCH["hidden"], ARCH["inter"])
+    except (TypeError, KeyError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    loop, queue, cancel = asyncio.get_running_loop(), asyncio.Queue(), threading.Event()
+    def work():
+        try:
+            for event in run_experiment(rt, body, cancel):
+                loop.call_soon_threadsafe(queue.put_nowait, event)
+        except Exception as exc:
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "error", "error": str(exc)})
+        finally:
+            loop.call_soon_threadsafe(queue.put_nowait, {"type": "done", "cancelled": cancel.is_set()})
+    async def events():
+        # Start on consumption, so an abandoned request never starts model work.
+        worker = asyncio.create_task(asyncio.to_thread(work))
+        try:
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=1.)
+                except asyncio.TimeoutError:
+                    if await req.is_disconnected():
+                        break
+                    yield ": keepalive\n\n"
+                    continue
+                yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
+                if event["type"] == "done":
+                    break
+        finally:
+            cancel.set()
+            # Keep a strong reference until the worker has removed its hooks.
+            await asyncio.shield(worker)
+    return StreamingResponse(events(), media_type="text/event-stream", headers={"Cache-Control": "no-cache"})
+
+
+async def score_text(text, chat=False, heads=False, residuals=False):
     """Every neuron's activation at every token of `text` ([L, T, N]) and its signed score: the positive side as a
-    multiple of the neuron's typical max, the negative side of its typical min (act_scale.npz). With heads, the
+    multiple of the neuron's typical max, the negative side of its typical min. With heads, the
     attention heads' patterns and write sizes are kept too (rt.heads)."""
     ids = rt.chat_ids(text) if chat else rt.tok(text).input_ids
     ids = ids[:MAX_INFER_TOKENS]
-    acts = await asyncio.to_thread(rt.full_activations, ids, heads)  # [L, T, N]
-    sc = np.load(ACT_SCALE)
+    result = await asyncio.to_thread(rt.full_activations, ids, heads, residuals)
+    acts, trace = result if residuals else (result, None)
+    sc = active_act_scale()
     # a side the neuron barely reaches in calibration is scaled by at least a tenth of its other side
     pos = np.maximum(sc["pos"], np.maximum(0.1 * -sc["neg"], 1e-3))[:, None, :]
     neg = np.minimum(sc["neg"], np.minimum(-0.1 * sc["pos"], -1e-3))[:, None, :]
     score = np.where(acts >= 0, acts / pos, -(acts / neg)).astype(np.float32)
     if score.shape[1] > 1:
         score[:, 0, :] = 0  # position 0 is the attention-sink token, outside the range the scale was measured on
-    return ids, acts, score
+    return (ids, acts, score, trace) if residuals else (ids, acts, score)
 
 
 @app.post("/api/infer")
 async def infer(req: Request):
     """Runs text through the model and keeps every neuron's activation at every token for /api/infer/view."""
     b = await req.json()
-    if not os.path.exists(ACT_SCALE) or rt.tok is None:
+    if rt.tok is None or active_act_scale() is None:
         return {"ready": False}
-    ids, acts, score = await score_text(b["text"], b.get("chat", False), heads=True)
+    global _infer
+    ids, acts, score, trace = await score_text(b["text"], b.get("chat", False), heads=True, residuals=True)
     units = rt.token_units(ids)
     unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
-    _infer.clear()
-    _infer.update(ids=ids, toks=[units[unit_of[i]][0] for i in range(len(ids))], acts=acts, score=score, units=units)
+    capture = uuid4().hex
+    _infer = dict(ids=ids, toks=[units[unit_of[i]][0] for i in range(len(ids))], acts=acts, score=score,
+                  units=units, residuals=trace, capture=capture, model_key=trace["model_key"], batch=trace["batch"])
     # one chip per unit; clicking it selects the unit's last token (the one that completes the character)
-    return {"ready": True, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units]}
+    return {"ready": True, "capture": capture, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units]}
+
+
+@app.get("/api/infer/residual")
+async def infer_residual(capture: str, pos: int = Query(ge=0), layer: int = Query(ge=0), n: int = Query(default=-1, ge=-1)):
+    source = _infer
+    snapshot = source.copy()
+    if not snapshot.get("residuals") or snapshot.get("capture") != capture:
+        return JSONResponse({"error": "Residual capture is stale; run the text again."}, status_code=409)
+    if pos >= len(snapshot["ids"]) or layer >= ARCH["n_layers"] or n >= ARCH["inter"]:
+        return JSONResponse({"error": "Invalid residual position, layer or neuron."}, status_code=400)
+    try:
+        result = await asyncio.to_thread(inspect_residual, rt, snapshot, pos, layer, n)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=409)
+    if _infer is not source or _infer.get("capture") != capture:
+        return JSONResponse({"error": "Residual capture is stale; run the text again."}, status_code=409)
+    return result
+
+
+@app.get("/api/infer/residual/export")
+def export_residual(capture: str, pos: int = Query(ge=0)):
+    snapshot = _infer.copy()
+    if not snapshot.get("residuals") or snapshot.get("capture") != capture:
+        return JSONResponse({"error": "Residual capture is stale; run the text again."}, status_code=409)
+    if pos >= len(snapshot["ids"]):
+        return JSONResponse({"error": "Invalid residual position."}, status_code=400)
+    rows = residual_rows(snapshot["residuals"], pos)
+    return {"capture": capture, "pos": pos, "token": snapshot["toks"][pos], "batch": snapshot.get("batch"),
+            "stages": {"pre": "block input", "mid": "after attention, before MLP norm", "post": "block output"},
+            "layers": [{k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in row.items()} for row in rows]}
 
 
 @app.get("/api/infer/view")
 async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 99, min: float = 1.0, q: str = "",
-                     limit: int = 300):
+                     limit: int = 300, addresses: str = ""):
     """Neurons passing the filters for the last inferred text. pos = token index, or -1 for the strongest token.
-    Returns the list plus every neuron's signed score at that position (base64 float16, layer-major) for the map."""
+    Exact addresses bypass the ranking filters and preserve input order. The map uses layer-major float16 scores."""
+    neurons = []
+    if addresses:
+        if not re.fullmatch(r"[0-9]{1,8}:[0-9]{1,8}(?:,[0-9]{1,8}:[0-9]{1,8}){0,299}", addresses):
+            return JSONResponse({"error": "Invalid neuron addresses."}, status_code=400)
+        neurons = list(dict.fromkeys(tuple(map(int, address.split(":"))) for address in addresses.split(",")))
+        if any(l >= ARCH["n_layers"] or n >= ARCH["inter"] for l, n in neurons):
+            return JSONResponse({"error": "Invalid neuron addresses."}, status_code=400)
     if "score" not in _infer:
         return {"results": []}
     import base64
     S, A, toks = _infer["score"], _infer["acts"], _infer["toks"]  # [L, T, N]
     if pos >= S.shape[1]:
         return {"results": [], "total": 0}
-    if pos >= 0:
-        best, at = S[:, pos, :], np.full(S[:, 0, :].shape, pos)
-    else:
-        at = S.argmax(1) if sign == "+" else S.argmin(1) if sign == "-" else np.abs(S).argmax(1)  # [L, N]
-        best = np.take_along_axis(S, at[:, None, :], 1)[:, 0, :]
-    view = best.copy()
-    keep = np.abs(best) >= min
-    if sign == "+": keep &= best > 0
-    if sign == "-": keep &= best < 0
-    lay = np.arange(best.shape[0])[:, None]
-    keep &= (lay >= lo) & (lay <= hi)
     idx = lens_index()
-    vocab = await asyncio.to_thread(rt.vocab_strings)
-    if q.strip() and idx is not None:
-        ql = q.strip().lower()
-        match = np.array([i for i, t in enumerate(vocab) if ql in t.lower()], dtype=np.int32)
-        lens_hit = np.where(best[..., None] >= 0, np.isin(idx["up"][:, :, :6], match), np.isin(idx["down"][:, :, :6], match)).any(-1)
-        keep &= lens_hit
-    view[~keep] = 0
-    ls, ns = np.nonzero(keep)
-    order = np.argsort(-np.abs(best[ls, ns]))[:limit]
+    vocab = await asyncio.to_thread(rt.vocab_strings) if idx is not None else []
+    if neurons:
+        ls, ns = np.asarray(neurons).T
+        ts = np.full(len(neurons), pos) if pos >= 0 else np.abs(S[ls, :, ns]).argmax(1)
+        view = np.zeros_like(S[:, 0, :])
+        view[ls, ns] = S[ls, ts, ns]
+        total = len(neurons)
+    else:
+        if pos >= 0:
+            best, at = S[:, pos, :], np.full(S[:, 0, :].shape, pos)
+        else:
+            at = S.argmax(1) if sign == "+" else S.argmin(1) if sign == "-" else np.abs(S).argmax(1)  # [L, N]
+            best = np.take_along_axis(S, at[:, None, :], 1)[:, 0, :]
+        keep = np.abs(best) >= min
+        if sign == "+": keep &= best > 0
+        if sign == "-": keep &= best < 0
+        lay = np.arange(best.shape[0])[:, None]
+        keep &= (lay >= lo) & (lay <= hi)
+        if q.strip() and idx is not None:
+            ql = q.strip().lower()
+            match = np.array([i for i, t in enumerate(vocab) if ql in t.lower()], dtype=np.int32)
+            lens_hit = np.where(best[..., None] >= 0, np.isin(idx["up"][:, :, :6], match), np.isin(idx["down"][:, :, :6], match)).any(-1)
+            keep &= lens_hit
+        view = np.where(keep, best, 0)
+        ls, ns = np.nonzero(keep)
+        total = len(ls)
+        order = np.argsort(-np.abs(best[ls, ns]))[:limit]
+        ls, ns = ls[order], ns[order]
+        ts = at[ls, ns]
     nm, res = names(), []
-    for o in order:
-        l, n = int(ls[o]), int(ns[o]); sg = "+" if best[l, n] > 0 else "-"
+    for l, n, t in zip(ls.tolist(), ns.tolist(), ts.tolist()):
+        score = float(S[l, t, n])
+        act = float(A[l, t, n])
+        sg = "+" if score > 0 or (neurons and score == 0 and act >= 0) else "-"
         lens = [vocab[k] for k in (idx["up"] if sg == "+" else idx["down"])[l, n, :6]] if idx is not None else []
-        t = int(at[l, n])
-        res.append({"layer": l, "n": n, "sign": sg, "score": round(float(abs(best[l, n])), 2),
-                    "act": round(float(A[l, t, n]), 2), "token": toks[t], "pos": t,
+        res.append({"layer": l, "n": n, "sign": sg, "score": round(abs(score), 2),
+                    "act": act if neurons else round(act, 2), "token": toks[t], "pos": t,
                     "name": nm.get(f"L{l}/N{n}", ""), "lens": lens})
     blob = base64.b64encode(view.astype(np.float16).tobytes()).decode()
-    return {"results": res, "total": int(keep.sum()), "map": blob, "shape": list(view.shape)}
+    return {"results": res, "total": total, "map": blob, "shape": list(view.shape)}
 
 
 def _heads_for_infer():
@@ -562,13 +761,21 @@ HEAD_TEXTS = [
 _hprof = {}
 
 
-def _head_profiles():
+def _compute_head_profiles():
     """Where every head looks over HEAD_TEXTS, per display unit, for queries from the 4th unit on:
     dist: mean share of |weight| on self / the previous unit / units 2-5 back / further back / the first unit;
     neg: mean share of negative weight; src: per unit string, the |weight| it receives against a uniform pattern's;
     pairs: the strongest single reads more than one unit back (past the first unit)."""
-    path = os.path.join(CACHE, "head_profiles.json")
-    key = json.dumps(HEAD_TEXTS)
+    suffix = "" if rt.quantization == "none" else f"_{rt.quantization}"
+    if rt.compute_dtype != "bfloat16":
+        suffix += f"_{rt.compute_dtype}"
+    active_batch = rt.batch_info()
+    if active_batch:
+        suffix += f"_batch_{active_batch['id']}"
+    path = os.path.join(CACHE, f"head_profiles{suffix}.json")
+    key = rt._weight_cache_key(json.dumps(HEAD_TEXTS))
+    if active_batch:
+        key += f":batch:{active_batch['id']}"
     if _hprof.get("key") == key:
         return _hprof["data"]
     if os.path.exists(path):
@@ -634,6 +841,12 @@ def _head_profiles():
     return d
 
 
+def _head_profiles():
+    # A profile spans several forward passes; keep one batch active throughout.
+    with rt.lock:
+        return _compute_head_profiles()
+
+
 @app.get("/api/head/profile")
 async def head_profile(layer: int, head: int):
     """One head's profile over the reference texts (_head_profiles), with each pair's query and key unit text and
@@ -654,6 +867,8 @@ def head_info(layer: int, head: int, top: int = 24):
     """What one attention head reads and writes, from weights: its linked neurons (runtime.head_links) and their
     positive-pole lens tokens pooled the way the web summary pools a cone (weighted by z, ranked by lift over each
     layer's base rate)."""
+    if rt.lora_path:
+        return JSONResponse({"error": "Head summaries require a precomputed lens for the active model."}, status_code=409)
     links = rt.head_links(layer, head)
     lens, v, base, src = _lens_base()
 
@@ -700,6 +915,8 @@ def infer_paths(pos: int, top: int = 300, min: float = 1.0):
     N = S.shape[1]
     active = {(int(i // N), int(i % N)) for i in cand}
     ci = rt.con_index()
+    if ci is None:
+        return Response(b"", media_type="application/octet-stream", headers={"X-Web-Total": "0"})
     rows = []
     for l, n in active:
         for i in range(ci["k"]):
@@ -732,6 +949,8 @@ def cone_links(layer, n, k=2, zmin=15, cap=20000, first=None, hops=None):
     neuron's top `first` links (all when None), later hops each node's top k with z >= zmin, up to `hops` hops; each side keeps at most cap / 2 links.
     Rows: src layer, src neuron, dst layer, dst neuron, z * sign, hop (positive downstream, negative upstream)."""
     ci = rt.con_index()
+    if ci is None:
+        return []
     out = []
     for side, step in (("down", 1), ("up", -1)):
         zs, ls, ns, sg = ci[f"{side}_z"], ci[f"{side}_layer"], ci[f"{side}_n"], ci[f"{side}_sign"]
@@ -775,6 +994,8 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
     Downstream gives
     `toward` (the driven pole) and `away` (the opposite pole); upstream gives `fed_by` (the pole that excites it) and
     `held_by` (the pole that inhibits it)."""
+    if rt.lora_path:
+        return JSONResponse({"error": "Web summaries require a precomputed lens for the active model."}, status_code=409)
     if src == "steer":
         lens, v, base, key_src = _lens_base()
     else:
@@ -832,23 +1053,20 @@ def web_summary(layer: int, n: int, first: int = 5, k: int = 2, top: int = 30, s
 AGENT_PROMPT = os.path.join(ROOT, "explorer", "agent_prompt.md")
 AGENT_DIR = os.path.join(ROOT, "explorer", "cache", "agent")  # claude's cwd, so no project settings or CLAUDE.md apply
 _chats = {}
-_act = {}
 
 
 def act_range(layer, n):
-    f = ffw()
+    f = None if rt.lora_path else ffw()
     if f is not None:
         mean = f["sum"][layer, n] / f["count"]
         return {"act_max": round(float(f["top_val"][layer, 0, n]), 3), "act_min": round(float(f["bot_val"][layer, 0, n]), 3),
                 "mean": round(float(mean), 4), "std": round(float(np.sqrt(max(f["sumsq"][layer, n] / f["count"] - mean ** 2, 0))), 4),
                 "over_tokens": f["count"], "source": "FineFineWeb"}
-    if "pos" not in _act and os.path.exists(ACT_SCALE):
-        z = np.load(ACT_SCALE)
-        _act.update(pos=z["pos"], neg=z["neg"], tokens=int(z["tokens"]))
-    if "pos" not in _act:
+    scale = active_act_scale()
+    if scale is None:
         return None
-    return {"act_max": round(float(_act["pos"][layer, n]), 3), "act_min": round(float(_act["neg"][layer, n]), 3),
-            "over_tokens": _act["tokens"], "source": "FineWeb-Edu"}
+    return {"act_max": round(float(scale["pos"][layer, n]), 3), "act_min": round(float(scale["neg"][layer, n]), 3),
+            "over_tokens": scale["tokens"], "source": "LoRA calibration" if rt.lora_path else "FineWeb-Edu"}
 
 
 FFW = os.path.join(ROOT, "explorer", "cache", "ffw")  # sweep/finefineweb.py output: corpus.npz, urls.json, acts.npz
@@ -918,7 +1136,7 @@ async def exemplars(request: Request, layer: int, n: int, k: int = 8, before: in
 def agent_overview():
     runs = layer_runs()
     return {"model": MODEL, "arch": ARCH, "layers_with_sweeps": sorted(runs),
-            "named_neurons": len(names()), "live_model": not NO_MODEL}
+            "named_neurons": len(names()), "live_model": not NO_MODEL, "loading": rt.loading_info()}
 
 
 @app.get("/api/agent/names")
@@ -1166,6 +1384,8 @@ async def agent_compare(req: Request):
     texts: [text | {label, text}], chat?}. Per neuron and text: the strongest positive and negative activation with
     its token, and the peak score (activation over the neuron's usual extreme; position 0, the sink, left out)."""
     b = await req.json()
+    if active_act_scale() is None:
+        return {"error": "Activation scoring requires calibration for the active model."}
     if off := _live_off():
         return off
     neurons = [(int(x["layer"]), int(x["n"])) for x in b.get("neurons") or []][:300]
@@ -1195,6 +1415,8 @@ async def agent_fires(req: Request):
     contains `token`, else the token where any neuron fires hardest; `at` picks a token by index into `tokens`,
     negative from the end). Leaves the person's paste box alone."""
     b = await req.json()
+    if active_act_scale() is None:
+        return {"error": "Activation scoring requires calibration for the active model."}
     if off := _live_off():
         return off
     ids, acts, score = await score_text(b["text"], b.get("chat", False))
@@ -1216,7 +1438,7 @@ async def agent_fires(req: Request):
         sg = "+" if S[l, n] > 0 else "-"
         res.append({"neuron": f"L{l} N{n}", "pole": sg, "score": round(float(abs(S[l, n])), 2),
                     "act": round(float(acts[l, pos, n]), 3), "name": nm.get(f"L{l}/N{n}") or None,
-                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]]})
+                    "steer": [v[t] for t in st["up" if sg == "+" else "down"][l, n, :6]] if st is not None else []})
     return {"tokens": toks, "at": pos, "token": toks[pos],
             "note": "score = activation / the neuron's typical extreme on that side; 1 = as strong as its usual max",
             "neurons": res}
@@ -1903,26 +2125,229 @@ async def _start_reaper():
 
 @app.get("/api/status")
 def status():
-    return {"status": rt.status}
+    loading = rt.loading_info()
+    return {"status": loading["status"], "error": loading["error"], "loading": loading,
+            "switching": _model_switching, "active_batch": rt.batch_info()}
+
+
+@app.get("/api/neuron-batches")
+def neuron_batches():
+    try:
+        saved = batches.list()
+    except (OSError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    return {"batches": saved["batches"], "groups": saved["groups"], "active_batch": rt.batch_info(), "model": MODEL,
+            "model_revision": MODEL_REVISION, "quantization": rt.quantization, "compute_dtype": rt.compute_dtype,
+            "n_layers": ARCH["n_layers"], "intermediate_size": ARCH["inter"], "live_model": not NO_MODEL}
+
+
+class BatchSaveRequest(BaseModel):
+    group_id: str
+    name: str
+    notes: str = ""
+    model: str
+    model_revision: str | None = None
+    quantization: str
+    compute_dtype: str = "bfloat16"
+    operations: list[dict]
+    source_batch_id: str | None = None
+
+
+def _batch_matches(batch):
+    return (batch["model"] == MODEL and batch["quantization"] == rt.quantization
+            and batch.get("compute_dtype", "bfloat16") == rt.compute_dtype
+            and batch.get("model_revision") == MODEL_REVISION)
+
+
+@app.post("/api/neuron-batches")
+def save_neuron_batch(body: BatchSaveRequest):
+    if not _batch_matches(body.model_dump()):
+        return JSONResponse({"error": "Batch model, weight format or compute precision does not match the loaded model."}, status_code=409)
+    try:
+        operations = validate_operations(body.operations, ARCH["n_layers"], ARCH["inter"])
+        source_batch_id = body.source_batch_id or (rt.batch_info() or {}).get("id")
+        return batches.save(group_id=body.group_id, name=body.name, notes=body.notes, model=MODEL, model_revision=MODEL_REVISION,
+                            quantization=rt.quantization, compute_dtype=rt.compute_dtype, operations=operations,
+                            source_batch_id=source_batch_id)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+class BatchGroupRequest(BaseModel):
+    name: str
+
+
+@app.post("/api/neuron-batches/groups")
+def create_batch_group(body: BatchGroupRequest):
+    try:
+        return batches.create_group(body.name)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+
+
+class BatchRenameRequest(BaseModel):
+    name: str
+
+
+def _edit_saved_batch(batch_id, *, name=None):
+    if not rt.lock.acquire(blocking=False):
+        return JSONResponse({"error": "The model is busy; stop generation and try again."}, status_code=409)
+    try:
+        if name is None:
+            batch = batches.delete(batch_id)
+            if (rt.batch_info() or {}).get("id") == batch_id:
+                rt.clear_batch()
+                _infer.clear()
+                _hprof.clear()
+        else:
+            batch = batches.rename(batch_id, name)
+            rt.rename_batch(batch_id, batch["name"])
+        return {"batch": batch, "active_batch": rt.batch_info()}
+    except KeyError:
+        return JSONResponse({"error": "Neuron batch not found."}, status_code=404)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except OSError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=500)
+    finally:
+        rt.lock.release()
+
+
+@app.patch("/api/neuron-batches/{batch_id}")
+def rename_neuron_batch(batch_id: str, body: BatchRenameRequest):
+    return _edit_saved_batch(batch_id, name=body.name)
+
+
+@app.delete("/api/neuron-batches/{batch_id}")
+def delete_neuron_batch(batch_id: str):
+    return _edit_saved_batch(batch_id)
+
+
+def _change_batch(batch_id=None):
+    if not rt.lock.acquire(blocking=False):
+        return JSONResponse({"error": "The model is busy; stop generation and try again."}, status_code=409)
+    try:
+        if batch_id is None:
+            rt.clear_batch()
+        else:
+            if NO_MODEL:
+                return JSONResponse({"error": "Live model disabled (EXPLORER_NO_MODEL)"}, status_code=400)
+            batch = batches.get(batch_id)
+            if not _batch_matches(batch):
+                return JSONResponse({"error": "Batch model, weight format or compute precision does not match the loaded model."}, status_code=409)
+            batch["operations"] = validate_operations(batch["operations"], ARCH["n_layers"], ARCH["inter"])
+            rt.use_batch(batch)
+        _infer.clear()
+        _hprof.clear()
+        return {"active_batch": rt.batch_info()}
+    except KeyError:
+        return JSONResponse({"error": "Neuron batch not found."}, status_code=404)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
+    finally:
+        rt.lock.release()
+
+
+@app.post("/api/neuron-batches/stop")
+def stop_neuron_batch():
+    return _change_batch()
+
+
+@app.post("/api/neuron-batches/{batch_id}/use")
+def use_neuron_batch(batch_id: str):
+    return _change_batch(batch_id)
+
+
+@app.get("/api/model/loading")
+def model_loading():
+    from importlib.util import find_spec
+    from dataclasses import asdict
+    return {**rt.loading_info(), "options": [asdict(fmt) for fmt in FORMATS], "compute_dtypes": COMPUTE_DTYPES,
+            "backends": {name: {"installed": find_spec(name) is not None,
+                                 "supported_device": rt.device() == "cuda"}
+                         for name in ("bitsandbytes", "hqq")}}
+
+
+class ModelLoadingRequest(BaseModel):
+    quantization: str
+    compute_dtype: str | None = None
+    lora_path: str | None = None
+
+
+@app.post("/api/model/loading")
+async def set_model_loading(body: ModelLoadingRequest):
+    global _model_switching
+    try:
+        weight_format(body.quantization)
+        if body.compute_dtype is not None:
+            resolve_compute_dtype(body.compute_dtype)
+    except ValueError as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    if _model_switching or _active_api_requests:
+        return JSONResponse({"error": "The model is busy; stop generation and try again."}, status_code=409)
+    _model_switching = True
+
+    def load():
+        global _model_switching
+        # Streaming generation can outlive its HTTP request headers.
+        if not rt.lock.acquire(blocking=False):
+            _model_switching = False
+            raise RuntimeError("The model is busy; stop generation or wait for loading/indexing to finish.")
+        try:
+            rt.select_quantization(body.quantization, body.compute_dtype, body.lora_path)
+            _prepare_live_model()
+        finally:
+            _infer.clear()
+            _hprof.clear()
+            rt.lock.release()
+            # The worker owns this flag, even if the browser disconnects while the weights are loading.
+            _model_switching = False
+
+    try:
+        await asyncio.shield(asyncio.to_thread(load))
+        return rt.loading_info()
+    except (ValueError, ImportError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+    except Exception as exc:
+        return JSONResponse({"error": str(exc)}, status_code=503)
 
 
 app.mount("/", StaticFiles(directory=os.path.join(ROOT, "explorer", "static"), html=True), name="static")
 
-@app.on_event("startup")
-def preload():
-    def go():
-        if NO_MODEL:
-            rt.status = "no model"
-            rt.vocab_strings()
-            return
+
+def _prepare_live_model():
+    try:
         rt.ensure_loaded()
-        if not os.path.exists(LENS_INDEX):
+        if not rt.lora_path and not os.path.exists(LENS_INDEX):
+            rt.set_load_state("loading", "lens")
             os.makedirs(os.path.dirname(LENS_INDEX), exist_ok=True)
             rt.build_lens_index(LENS_INDEX)
+        rt.set_load_state("loading", "vocab")
         rt.vocab_strings()
-        if not os.path.exists(ACT_SCALE):
+        if rt.lora_path:
+            rt.set_load_state("loading", "ranges")
+            with open(LORA_CALIBRATION_TEXT, encoding="utf-8") as corpus:
+                texts = [text.strip() for text in corpus.read().split("\n\n") if text.strip()]
+            rt.lora_act_scale = rt.build_act_scale(texts=texts)
+        elif not os.path.exists(ACT_SCALE):
+            rt.set_load_state("loading", "ranges")
             rt.build_act_scale(ACT_SCALE)
-    threading.Thread(target=go, daemon=True).start()
+    except Exception as exc:
+        rt.set_load_state("error", error=str(exc) or type(exc).__name__)
+        raise
+    rt.set_load_state("ready")
+
+
+@app.on_event("startup")
+def preload_cache_vocab():
+    if NO_MODEL:
+        threading.Thread(target=rt.vocab_strings, daemon=True).start()
 
 
 if __name__ == "__main__":

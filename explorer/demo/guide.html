@@ -1,0 +1,19 @@
+<section id="demo-help" aria-labelledby="demo-help-title" hidden>
+  <div class="model-heading">
+    <h2 id="demo-help-title">神经元探索器 · 练习页</h2>
+    <button id="demo-help-close" type="button" aria-label="关闭练习提示">×</button>
+  </div>
+  <p>这是可离线打开的静态演示。图表、token、激活、残差流、干预结果和回复均为浏览器生成的示例数据，不代表真实模型效果。</p>
+  <ol>
+    <li>用「透镜」搜 <code>cat</code>，看看结果里的正负方向和排名。</li>
+    <li>打开 <code>L22 N2742</code>，在右侧切换示例、对话、残差流、详情和频率。</li>
+    <li>在「运行」添加最多 8 条独立文本，点击标签切换编辑和三维分析。</li>
+    <li>在「残差流」试用添加方向、移除写入、去除投影和状态替换，分别选择来源和目标 token，并排查看模拟对照结果。</li>
+    <li>左侧「残差分析」可观察全部 32 层；「干预此位置」会把当前选择带入右侧设置。</li>
+  </ol>
+  <div class="demo-guide-actions">
+    <button id="demo-open-residual" type="button">试用多文本残差对照</button>
+    <button id="demo-search-example" type="button">试搜 cat</button>
+    <button id="demo-open-example" type="button">打开示例神经元</button>
+  </div>
+</section>

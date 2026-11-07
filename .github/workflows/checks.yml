@@ -1,0 +1,57 @@
+name: Checks
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  source-and-demo:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Check Python syntax
+        run: python -m compileall -q explorer sweep tests tools
+      - name: Check demo is generated from current sources
+        run: |
+          python explorer/build_demo.py
+          git diff --exit-code -- neuron-explorer-demo.html
+      - name: Test standalone demo and release selection
+        run: |
+          python -m unittest discover -s tests -p test_demo_bundle.py -v
+          python -m unittest discover -s tests -p test_release.py -v
+          node tests/test_residual_vector.mjs
+          node tests/test_residual_lab.mjs
+      - name: Check release files, licenses, caches and local Git history
+        run: python tools/prepare_release.py --check
+
+  runtime-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      HF_HUB_OFFLINE: '1'
+      HF_DATASETS_OFFLINE: '1'
+      OMP_NUM_THREADS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: '0.13.7'
+          python-version: '3.12'
+      - name: Check lock and install test dependencies
+        run: |
+          uv lock --check
+          uv sync --locked --group dev --extra quantization --extra lora
+      - name: Run small-tensor and API tests without model downloads
+        run: uv run --locked --group dev --extra quantization --extra lora python -m unittest discover -s tests -v

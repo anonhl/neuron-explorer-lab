@@ -1,0 +1,61 @@
+{
+  "upstream_repository": "https://github.com/lyramakesmusic/neuron-explorer",
+  "reference_commit": "7ec363d2d9686802a1b4aa7c6d8a2627b1759159",
+  "checked_on": "2026-11-07",
+  "files": [
+    {
+      "path": "explorer/cache/act_scale.npz",
+      "git_blob_sha1": "89fb3b20763638603a67b588ce5efa27dd481faf",
+      "sha256": "eb2137560c033832075d285bfe6eafa34812a475c67312b50b76896a5a0b8b6e",
+      "size": 2360046
+    },
+    {
+      "path": "explorer/cache/connections.npz",
+      "git_blob_sha1": "a0460d547a1887de69e15cd815ad0861140c9534",
+      "sha256": "9efceaabe974b0eaea626c1fc620787e6087b5f548a0c2614cacf24d939b5a15",
+      "size": 54315904
+    },
+    {
+      "path": "explorer/cache/jpp_index.npz",
+      "git_blob_sha1": "852f570417ae9e81c6be17ab0a0f006e2978c0e2",
+      "sha256": "74ef670ba57e52b8c3eec0b61b17f2d39bfbc11de88d7988d3613cc80e303cba",
+      "size": 28312050
+    },
+    {
+      "path": "explorer/cache/layout_writes.npz",
+      "git_blob_sha1": "e4412d1cb8c8eae11ed00713166ec49f62255c44",
+      "sha256": "dffd6e993b0f7ddfcd5a741675f5300ee6488d0970ab8e696eb96c34878be0ce",
+      "size": 590086
+    },
+    {
+      "path": "explorer/cache/lens_index.npz",
+      "git_blob_sha1": "db6932593bcaf0cf07b224ff2260c0a82a8281d2",
+      "sha256": "055f3d3a5c5904ca60003548ebcf853008f8b0f2d1d94ed5c02b47504f18ae02",
+      "size": 28312050
+    },
+    {
+      "path": "explorer/cache/r_index.npz",
+      "git_blob_sha1": "28ab025e94fa4d8b2966cf570d92352cd95edee3",
+      "sha256": "be165a487a3b643cf78c0e0a18e6751a50f4c73b9fe21c2b11703822e15e524e",
+      "size": 28312050
+    },
+    {
+      "path": "explorer/cache/s_index.npz",
+      "git_blob_sha1": "e4a37a55cbfa9e0b3b6c007d2951d30f40b2223f",
+      "sha256": "ba59a180de5f217ac27df2cfe44c948225db026e39a6a1800605c43f2120782c",
+      "size": 28312050
+    },
+    {
+      "path": "explorer/cache/steer_index.npz",
+      "git_blob_sha1": "0b34f578d3e23d25feadea14829e4b957ffe5ca5",
+      "sha256": "b2e24254e41ba9fb21def74ddba6e357b41e0f129fc8c119a7f5d20614a9e486",
+      "size": 30672082
+    },
+    {
+      "path": "explorer/cache/vocab.json",
+      "git_blob_sha1": "ab996ccf3cb24ae36caede27ab19ce38c0fcf238",
+      "sha256": "e8070e638cd3b159706912a575f793d1fe56be3a311ab17ca1489705004a557c",
+      "size": 4057776
+    }
+  ]
+}
