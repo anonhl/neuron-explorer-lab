@@ -28,6 +28,7 @@ from rank import compute_units  # noqa: E402
 from runtime import CACHE, MODEL, NO_MODEL, ModelLoadRequired, Runtime  # noqa: E402
 from quantization import COMPUTE_DTYPES, FORMATS, resolve_compute_dtype, weight_format  # noqa: E402
 from neuron_batches import BatchStore, validate_operations  # noqa: E402
+from inference_cache import InferenceCache
 from residuals import inspect_residual, residual_rows  # noqa: E402
 from residual_interventions import validate_experiment, tokenize_texts, run_experiment  # noqa: E402
 
@@ -481,6 +482,22 @@ async def fires(text: str, limit: int = 300, chat: bool = False):
 
 
 _infer = {}
+_inference_cache = InferenceCache()
+_infer_lock = asyncio.Lock()
+
+
+def _configure_inference_cache():
+    _inference_cache.configure((rt._weight_cache_key("residual"), repr(rt.batch_info()), id(active_act_scale())))
+
+
+def _inference_summary(snapshot):
+    score, acts = snapshot["score"], snapshot["acts"]
+    # Keep both signs, so threshold and sign changes only filter cached measurements.
+    positions = np.stack((score.argmax(1), score.argmin(1)), axis=1)
+    return dict(score=np.take_along_axis(score, positions, axis=1),
+                acts=np.take_along_axis(acts, positions, axis=1),
+                source_positions=positions, toks=snapshot["toks"])
+
 
 
 @app.post("/api/residual/tokens")
@@ -564,14 +581,24 @@ async def infer(req: Request):
     if rt.tok is None or active_act_scale() is None:
         return {"ready": False}
     global _infer
-    ids, acts, score, trace = await score_text(b["text"], b.get("chat", False), heads=True, residuals=True)
-    units = rt.token_units(ids)
-    unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
-    capture = uuid4().hex
-    _infer = dict(ids=ids, toks=[units[unit_of[i]][0] for i in range(len(ids))], acts=acts, score=score,
-                  units=units, residuals=trace, capture=capture, model_key=trace["model_key"], batch=trace["batch"])
-    # one chip per unit; clicking it selects the unit's last token (the one that completes the character)
-    return {"ready": True, "capture": capture, "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units]}
+    async with _infer_lock:
+        _configure_inference_cache()
+        key = (b["text"], bool(b.get("chat", False)))
+        active_texts = b.get("texts")
+        if isinstance(active_texts, list) and all(isinstance(text, str) for text in active_texts):
+            _inference_cache.retain({(text, False) for text in active_texts} | {key})
+        cached = await asyncio.to_thread(_inference_cache.restore, key)
+        if cached is not None:
+            _infer, rt.heads = cached
+        else:
+            ids, acts, score, trace = await score_text(b["text"], b.get("chat", False), heads=True, residuals=True)
+            units = rt.token_units(ids)
+            unit_of = {i: k for k, (_, idx) in enumerate(units) for i in idx}
+            _infer = dict(ids=ids, toks=[units[unit_of[i]][0] for i in range(len(ids))], acts=acts, score=score,
+                          units=units, residuals=trace, capture=uuid4().hex, model_key=trace["model_key"], batch=trace["batch"])
+            await asyncio.to_thread(_inference_cache.save, key, _infer, _inference_summary(_infer), rt.heads)
+        units = _infer["units"]
+        return {"ready": True, "capture": _infer["capture"], "tokens": [u[0] for u in units], "pos": [u[1][-1] for u in units]}
 
 
 @app.get("/api/infer/residual")
@@ -610,7 +637,7 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
     return await _infer_view(_infer, pos, sign, lo, hi, min, q, limit, addresses)
 
 
-async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="", limit=300, addresses=""):
+async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="", limit=300, addresses="", include_map=True):
     """Neurons passing the filters for the last inferred text. pos = token index, or -1 for the strongest token.
     Exact addresses bypass the ranking filters and preserve input order. The map uses layer-major float16 scores."""
     neurons = []
@@ -663,10 +690,14 @@ async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="",
         sg = "+" if score > 0 or (neurons and score == 0 and act >= 0) else "-"
         lens = [vocab[k] for k in (idx["up"] if sg == "+" else idx["down"])[l, n, :6]] if idx is not None else []
         res.append({"layer": l, "n": n, "sign": sg, "score": round(abs(score), 2),
-                    "act": act if neurons else round(act, 2), "token": toks[t], "pos": t,
+                    "act": act if neurons else round(act, 2),
+                    "token": toks[int(snapshot["source_positions"][l, t, n])] if "source_positions" in snapshot else toks[t],
+                    "pos": int(snapshot["source_positions"][l, t, n]) if "source_positions" in snapshot else t,
                     "name": nm.get(f"L{l}/N{n}", ""), "lens": lens})
-    blob = base64.b64encode(view.astype(np.float16).tobytes()).decode()
-    return {"results": res, "total": total, "map": blob, "shape": list(view.shape)}
+    result = {"results": res, "total": total}
+    if include_map:
+        result.update(map=base64.b64encode(view.astype(np.float16).tobytes()).decode(), shape=list(view.shape))
+    return result
 
 
 @app.post("/api/infer/common")
@@ -677,17 +708,15 @@ async def infer_common(req: Request):
         return JSONResponse({"error": "Provide 2–8 nonempty texts."}, status_code=400)
     if rt.tok is None or active_act_scale() is None:
         return {"ready": False, "results": []}
+    _configure_inference_cache()
+    snapshots = [_inference_cache.summary((text, False)) for text in texts]
+    if any(snapshot is None for snapshot in snapshots):
+        return {"ready": True, "message": "results.commonPending", "results": []}
     common = None
-    for text in texts:
-        ids, acts, score = await score_text(text)
-        units = rt.token_units(ids)
-        toks = [""] * len(ids)
-        for token, positions in units:
-            for position in positions:
-                toks[position] = token
-        result = await _infer_view(dict(score=score, acts=acts, toks=toks),
+    for snapshot in snapshots:
+        result = await _infer_view(snapshot,
             sign=b.get("sign", "both"), lo=int(b.get("lo", 0)), hi=int(b.get("hi", 99)),
-            min=float(b.get("min", 1)), q=b.get("q", ""), limit=ARCH["n_layers"] * ARCH["inter"])
+            min=float(b.get("min", 1)), q=b.get("q", ""), limit=ARCH["n_layers"] * ARCH["inter"], include_map=False)
         rows = {(r["layer"], r["n"]): r for r in result["results"] if r["score"] > 0}
         if common is None:
             common = rows

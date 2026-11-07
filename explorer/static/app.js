@@ -392,8 +392,6 @@ let qGen = 0;
 const stillWanted = (g, mode, q) => g === qGen && state.qMode === mode &&
   (mode === "fires" ? $("#lens-q").value : $("#lens-q").value.trim()) === q;
 async function runInfer(text, g) {
-  commonMode = false;
-  $("#inf-common").checked = false;
   residualLab.externalText(text);
   markLeftFresh("run");
   if (text !== state.inf.text) {
@@ -404,7 +402,7 @@ async function runInfer(text, g) {
     clearTimeout(tokTimer); tokHover = null;
     $("#inf-toks").replaceChildren();
     $("#run-rows").innerHTML = `<li class="head">${t("results.running")}</li>`;
-    const r = await api("/api/infer", { text });
+    const r = await api("/api/infer", { text, texts: residualLab.getTexts() });
     if (!stillWanted(g, "fires", text)) return;
     state.inf.pending = false;
     if (!r.ready) { $("#run-rows").innerHTML = `<li class="head">${esc(localizeStatus(state.statusText) || t("results.measuring"))}</li>`; return; }
@@ -490,8 +488,6 @@ let commonMode = false;
 const commonCheckbox = $("#inf-common");
 commonCheckbox.onchange = () => {
   commonMode = commonCheckbox.checked;
-  clearTimeout(lensTimer);
-  ++qGen;
   inferView();
 };
 let viewGen = 0;
