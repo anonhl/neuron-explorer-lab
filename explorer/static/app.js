@@ -392,6 +392,8 @@ let qGen = 0;
 const stillWanted = (g, mode, q) => g === qGen && state.qMode === mode &&
   (mode === "fires" ? $("#lens-q").value : $("#lens-q").value.trim()) === q;
 async function runInfer(text, g) {
+  commonMode = false;
+  $("#inf-common").setAttribute("aria-pressed", "false");
   residualLab.externalText(text);
   markLeftFresh("run");
   if (text !== state.inf.text) {
@@ -484,12 +486,43 @@ $("#inf-addresses").addEventListener("input", () => {
   clearTimeout(infTimer);
   infTimer = setTimeout(() => inferView(qGen, tokHover ?? state.inf.pos), 200);
 });
+let commonMode = false;
+const commonButton = $("#inf-common");
+commonButton.onclick = () => {
+  commonMode = !commonMode;
+  commonButton.setAttribute("aria-pressed", String(commonMode));
+  clearTimeout(lensTimer);
+  ++qGen;
+  inferView();
+};
 let viewGen = 0;
 async function inferView(g = qGen, pos = state.inf.pos) {
   const f = state.inf, mine = ++viewGen;
   const query = $("#inf-addresses").value.trim();
   const exact = query ? neuronAddresses(query, 300) : null;
   $("#inf-addresses").setAttribute("aria-invalid", String(!!query && !exact));
+  if (commonMode) {
+    const texts = residualLab.getTexts();
+    if (texts.length < 2 || texts.some(text => !text.trim()) || (query && !exact)) {
+      fireResults = { ready: true, message: query && !exact ? "results.addressInvalid" : "results.commonNeed" };
+      renderResults(fireResults, $("#run-rows"));
+      if (leftTab === "run") map.setMarks([]);
+      return;
+    }
+    $("#run-rows").innerHTML = `<li class="head">${t("results.running")}</li>`;
+    try {
+      const r = await api("/api/infer/common", { texts, sign: f.sign,
+        lo: $("#inf-lo").value || 0, hi: $("#inf-hi").value || 99,
+        min: $("#inf-min").value || 0, q: $("#inf-q").value, addresses: exact || [] });
+      if (mine !== viewGen || g !== qGen) return;
+      fireResults = { ...r, fires: true, common: true };
+      renderResults(fireResults, $("#run-rows"));
+      if (leftTab === "run") map.setMarks((r.results || []).map(row => ({ ...row, w: Math.min(1, .25 + row.score / 4) })));
+    } catch (error) {
+      if (mine === viewGen && g === qGen) $("#run-rows").innerHTML = `<li class="head">${esc(localizeError(error))}</li>`;
+    }
+    return;
+  }
   if (query && (!exact || !f.text)) {
     const message = !exact ? "results.addressInvalid" : f.pending ? "results.running" : "results.addressRun";
     fireResults = { ready: true, message };
@@ -692,7 +725,7 @@ function renderResults(r, ol) {
     ${neuronIdHTML(`L${x.layer} N${x.n}`)}<span class="sg ${x.sign === "+" ? "up" : "down"}">${r.fires ? `${x.sign === "+" ? "" : "−"}${x.score.toFixed(1)}×` : `${x.sign === "+" ? "+" : "−"}${x.rank + 1}`}</span>
     <span class="w">${r.fires ? `<span class="tk">"${esc(x.token)}"</span>` : ""}${r.exact ? `<span class="tk">${t("results.activation", { value: Number(x.act.toPrecision(4)) })}</span>` : ""}${x.name ? `<b>${esc(x.name)}</b> ` : ""}${esc(x.lens.join(" "))}</span></li>`).join("");
   const total = r.total ?? 0;
-  const head = r.exact ? t("results.addressMatches", { total }) : r.fires ? tp("results.pass", total, { total }) : tp("results.summary", total, { total, tokens: r.tokens ?? 0 });
+  const head = r.common ? t("results.common", { total, texts: r.texts }) : r.exact ? t("results.addressMatches", { total }) : r.fires ? tp("results.pass", total, { total }) : tp("results.summary", total, { total, tokens: r.tokens ?? 0 });
   ol.innerHTML = `<li class="head">${head}</li>` + rows;
   syncListSelection(ol);
 }

@@ -82,9 +82,21 @@ function frequencyMarkup(t, lang, esc) {
   const th = (key, numeric = false) => `<th scope="col"${numeric ? ' class="num"' : ""}>${label(key)}</th>`;
   const lensSection = (lens, error, { renderToken = tokenLabel, showTotal = false } = {}) => {
     const lensCell = ({ count, positive }, total) => `<td class="num">${countShare(count, total, showTotal)}${poleShares(count, positive)}</td>`;
-    const tokens = lens?.rows.length ? table(th("token") + th("input", true) + th("output", true), lens.rows.map((row, i) =>
-      `<tr><td>${renderToken(row, i)}</td>${lensCell(row.up, lens.totals.up)}${lensCell(row.down, lens.totals.down)}</tr>`).join(""))
-      : message(error ? "lensError" : lens ? "noLens" : "loading");
+    let tokens;
+    if (lens?.rows.length) {
+      const ranked = side => lens.rows.map((row, index) => ({ row, index }))
+        .filter(({ row }) => row[side].count > 0)
+        .sort((a, b) => b.row[side].count - a.row[side].count);
+      const input = ranked("up"), output = ranked("down");
+      const cells = (entry, side) => entry
+        ? `<td>${renderToken(entry.row, entry.index)}</td>${lensCell(entry.row[side], lens.totals[side])}`
+        : '<td></td><td></td>';
+      tokens = table(th("token") + th("input", true) + th("token") + th("output", true),
+        Array.from({ length: Math.max(input.length, output.length) }, (_, i) =>
+          `<tr>${cells(input[i], "up")}${cells(output[i], "down")}</tr>`).join(""));
+    } else {
+      tokens = message(error ? "lensError" : lens ? "noLens" : "loading");
+    }
     return `<h2>${label("lens")}</h2>${message("lensHint")}${tokens}`;
   };
   return { share, tokenLabel, label, message, countCell, poleShares, sourceToken, table, th, lensSection };

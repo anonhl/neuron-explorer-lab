@@ -259,7 +259,7 @@
     }
     return +act.toFixed(3);
   }
-  function activationView(params) {
+  function activationView(params, limit = 80) {
     const pos = Number(params.get("pos") ?? -1);
     const sign = params.get("sign") || "both";
     const lo = Number(params.get("lo") || 0);
@@ -284,7 +284,7 @@
       rows.push({ layer, n, sign: side, score, lens: lens.slice(0, 6), name: nameFor(layer, n), ...best });
     }
     if (!addresses) rows.sort((a, b) => b.score - a.score);
-    return { results: rows.slice(0, 80), total: rows.length };
+    return { results: rows.slice(0, limit), total: rows.length };
   }
   function float16(value) {
     if (value === 0) return 0;
@@ -666,6 +666,26 @@
         const result=simulatedResidual(pos,layer,p.has('n')?Number(p.get('n')):-1);delete result.exportLayers;return json(result);
       }
       case "/api/infer/residual/export": return json({simulated:true,pos,layers:simulatedResidual(pos,0,-1).exportLayers});
+      case "/api/infer/common": {
+        const saved = inputPieces;
+        let common = null;
+        try {
+          for (const text of body.texts) {
+            inputPieces = pieces(text);
+            const params = new URLSearchParams({ sign: body.sign, lo: body.lo, hi: body.hi, min: body.min, q: body.q });
+            const rows = new Map(activationView(params, Infinity).results.map(row => [`${row.layer}:${row.n}`, row]));
+            common = common === null ? rows : new Map([...common].filter(([key]) => rows.has(key))
+              .map(([key, row]) => [key, row.score <= rows.get(key).score ? row : rows.get(key)]));
+          }
+          let rows = [...common.values()];
+          if (body.addresses?.length) {
+            const allowed = new Set(body.addresses.map(row => `${row.layer}:${row.n}`));
+            rows = rows.filter(row => allowed.has(`${row.layer}:${row.n}`));
+          }
+          rows.sort((a, b) => b.score - a.score);
+          return json({ ready: true, results: rows.slice(0, 300), total: rows.length, texts: body.texts.length });
+        } finally { inputPieces = saved; }
+      }
       case "/api/infer/view": {
         const view = activationView(p);
         if (!p.has("addresses")) {

@@ -607,6 +607,10 @@ def export_residual(capture: str, pos: int = Query(ge=0)):
 @app.get("/api/infer/view")
 async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 99, min: float = 1.0, q: str = "",
                      limit: int = 300, addresses: str = ""):
+    return await _infer_view(_infer, pos, sign, lo, hi, min, q, limit, addresses)
+
+
+async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="", limit=300, addresses=""):
     """Neurons passing the filters for the last inferred text. pos = token index, or -1 for the strongest token.
     Exact addresses bypass the ranking filters and preserve input order. The map uses layer-major float16 scores."""
     neurons = []
@@ -616,10 +620,10 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
         neurons = list(dict.fromkeys(tuple(map(int, address.split(":"))) for address in addresses.split(",")))
         if any(l >= ARCH["n_layers"] or n >= ARCH["inter"] for l, n in neurons):
             return JSONResponse({"error": "Invalid neuron addresses."}, status_code=400)
-    if "score" not in _infer:
+    if "score" not in snapshot:
         return {"results": []}
     import base64
-    S, A, toks = _infer["score"], _infer["acts"], _infer["toks"]  # [L, T, N]
+    S, A, toks = snapshot["score"], snapshot["acts"], snapshot["toks"]  # [L, T, N]
     if pos >= S.shape[1]:
         return {"results": [], "total": 0}
     idx = lens_index()
@@ -663,6 +667,39 @@ async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 9
                     "name": nm.get(f"L{l}/N{n}", ""), "lens": lens})
     blob = base64.b64encode(view.astype(np.float16).tobytes()).decode()
     return {"results": res, "total": total, "map": blob, "shape": list(view.shape)}
+
+
+@app.post("/api/infer/common")
+async def infer_common(req: Request):
+    b = await req.json()
+    texts = b.get("texts")
+    if not isinstance(texts, list) or not 2 <= len(texts) <= 8 or any(not isinstance(t, str) or not t.strip() for t in texts):
+        return JSONResponse({"error": "Provide 2–8 nonempty texts."}, status_code=400)
+    if rt.tok is None or active_act_scale() is None:
+        return {"ready": False, "results": []}
+    common = None
+    for text in texts:
+        ids, acts, score = await score_text(text)
+        units = rt.token_units(ids)
+        toks = [""] * len(ids)
+        for token, positions in units:
+            for position in positions:
+                toks[position] = token
+        result = await _infer_view(dict(score=score, acts=acts, toks=toks),
+            sign=b.get("sign", "both"), lo=int(b.get("lo", 0)), hi=int(b.get("hi", 99)),
+            min=float(b.get("min", 1)), q=b.get("q", ""), limit=ARCH["n_layers"] * ARCH["inter"])
+        rows = {(r["layer"], r["n"]): r for r in result["results"] if r["score"] > 0}
+        if common is None:
+            common = rows
+        else:
+            common = {key: min((row, rows[key]), key=lambda r: r["score"])
+                      for key, row in common.items() if key in rows}
+    addresses = b.get("addresses", [])
+    if addresses:
+        allowed = {(r["layer"], r["n"]) for r in addresses}
+        common = {key: row for key, row in common.items() if key in allowed}
+    rows = sorted(common.values(), key=lambda r: -r["score"])
+    return {"ready": True, "results": rows[:300], "total": len(rows), "texts": len(texts)}
 
 
 def _heads_for_infer():

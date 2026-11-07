@@ -280,6 +280,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   }
   render();
   return { render, setActive,
+    getTexts() { return texts.map(row => row.text); },
     configure({ layer, n, stage, pos }) {
       if (busy) return;
       Object.assign(form, { layer, neuron: n, stage, scope: 'token', method: 'add', direction: 'neuron', strength: .1 });
