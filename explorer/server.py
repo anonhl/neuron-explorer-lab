@@ -496,7 +496,7 @@ def _inference_summary(snapshot):
     positions = np.stack((score.argmax(1), score.argmin(1)), axis=1)
     return dict(score=np.take_along_axis(score, positions, axis=1),
                 acts=np.take_along_axis(acts, positions, axis=1),
-                source_positions=positions, toks=snapshot["toks"])
+                source_positions=positions, toks=snapshot["toks"], units=snapshot["units"], capture=snapshot["capture"])
 
 
 
@@ -729,6 +729,83 @@ async def infer_common(req: Request):
         common = {key: row for key, row in common.items() if key in allowed}
     rows = sorted(common.values(), key=lambda r: -r["score"])
     return {"ready": True, "results": rows[:300], "total": len(rows), "texts": len(texts)}
+
+
+@app.post("/api/infer/cached-texts")
+async def cached_text_tokens(req: Request):
+    b = await req.json()
+    texts = b.get("texts", [])
+    if not isinstance(texts, list) or not 1 <= len(texts) <= 8 or any(not isinstance(text, str) for text in texts):
+        return JSONResponse({"error": "Invalid cached text selection."}, status_code=400)
+    _configure_inference_cache()
+    rows = []
+    for index, text in enumerate(texts):
+        summary = _inference_cache.summary((text, False))
+        rows.append({"index": index, "text": text, "ready": summary is not None,
+                     "tokens": [u[0] for u in summary["units"]] if summary else [],
+                     "positions": [u[1][-1] for u in summary["units"]] if summary else []})
+    return {"texts": rows}
+
+
+@app.post("/api/infer/contexts")
+async def infer_contexts(req: Request):
+    """Inspect cached texts independently; never execute text inference or replace the active capture."""
+    b = await req.json()
+    texts = b.get("texts", [])
+    layer, neuron, position = int(b.get("layer", 0)), int(b.get("n", -1)), int(b.get("pos", -1))
+    sign = b.get("sign", "both")
+    if (not isinstance(texts, list) or not 1 <= len(texts) <= 8
+            or any(not isinstance(text, str) or not text.strip() for text in texts)
+            or not 0 <= layer < ARCH["n_layers"] or not -1 <= neuron < ARCH["inter"] or position < -1):
+        return JSONResponse({"error": "Invalid cached text selection."}, status_code=400)
+    _configure_inference_cache()
+    rows = []
+    for index, text in enumerate(texts):
+        summary = _inference_cache.summary((text, False))
+        if summary is None:
+            return {"ready": False, "message": "results.commonPending", "contexts": []}
+        if position >= 0:
+            pos = position
+        elif neuron >= 0:
+            peak = 0 if sign == "+" else 1 if sign == "-" else int(np.abs(summary["score"][layer, :, neuron]).argmax())
+            pos = int(summary["source_positions"][layer, peak, neuron])
+        else:
+            pos = len(summary["toks"]) - 1
+        key = (text, layer, neuron, pos)
+        row = _inference_cache.inspected(key)
+        if row is None:
+            restored = await asyncio.to_thread(_inference_cache.restore, (text, False), False)
+            if restored is None:
+                return {"ready": False, "message": "results.commonPending", "contexts": []}
+            snapshot, heads = restored
+            del restored, heads
+            if pos >= len(snapshot["ids"]):
+                return JSONResponse({"error": "Invalid cached token position."}, status_code=400)
+            residual = await asyncio.to_thread(inspect_residual, rt, snapshot, pos, layer, neuron)
+            row = {"text": text, "capture": snapshot["capture"], "pos": pos,
+                   "tokens": [unit[0] for unit in snapshot["units"]],
+                   "positions": [unit[1][-1] for unit in snapshot["units"]], "residual": residual}
+            _inference_cache.save_inspection(key, row)
+        rows.append({**row, "index": index})
+    return {"ready": True, "contexts": rows}
+
+
+@app.post("/api/infer/contexts/export")
+async def export_cached_context(req: Request):
+    b = await req.json()
+    _configure_inference_cache()
+    restored = await asyncio.to_thread(_inference_cache.restore, (b.get("text"), False), False)
+    if restored is None:
+        return JSONResponse({"error": "Cached text is unavailable; run the text again."}, status_code=409)
+    snapshot, heads = restored
+    del restored, heads
+    pos = int(b.get("pos", -1))
+    if not 0 <= pos < len(snapshot["ids"]):
+        return JSONResponse({"error": "Invalid cached token position."}, status_code=400)
+    rows = residual_rows(snapshot["residuals"], pos)
+    return {"capture": snapshot["capture"], "pos": pos, "token": snapshot["toks"][pos],
+            "batch": snapshot.get("batch"), "text": b["text"],
+            "layers": [{k: v.tolist() if isinstance(v, np.ndarray) else v for k, v in row.items()} for row in rows]}
 
 
 def _heads_for_infer():

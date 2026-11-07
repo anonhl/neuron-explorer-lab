@@ -1,5 +1,8 @@
 // One shared capture: changing layer, token or neuron only reads it; it never reruns inference.
-export function initResidualPanel(root, { api, t, esc, map, arch, onToken, onPick, onCompare, onIntervene, onRun, errorText }) {
+export function initResidualPanel(root, options) {
+  const { api, t, esc, map, arch, onToken, onPick, onCompare, onIntervene, onRun, errorText } = options;
+  let grouped = false, groupKey = null, groupPanels = [], mapIndex = 0, groupTokenHandlers = [];
+  const pendingGroupTokens = new Map();
   let capture = null, data = null, layer = 0, neuron = -1, stage = 'post', generation = 0, error = null, busy = false;
   let mapOn = true;
   let dimension = 0, windowStart = 0;
@@ -28,6 +31,7 @@ export function initResidualPanel(root, { api, t, esc, map, arch, onToken, onPic
     render(); map.focusResidual(layer, stage);
   };
   root.addEventListener('click', async e => {
+    if (grouped) return;
     const b = e.target.closest('button'); if (!b) return;
     if (b.dataset.resLayer != null) selectLayer(+b.dataset.resLayer);
     if (b.dataset.resPick != null) onPick(+b.dataset.layer, +b.dataset.resPick);
@@ -49,10 +53,11 @@ export function initResidualPanel(root, { api, t, esc, map, arch, onToken, onPic
       } catch (err) { error = err; render(); }
     }
   });
-  function selectLayer(l, nextStage = stage) { layer = l; neuron = -1; stage = nextStage; load(); }
+  function selectLayer(l, nextStage = stage) { if (grouped) { groupPanels[mapIndex]?.selectLayer(l, nextStage); return; } layer = l; neuron = -1; stage = nextStage; load(); }
   function syncMap() {
+    if (grouped) return;
     map.setResidualTrace(mapOn && data && capture ? { ...data, stage, dimension, windowStart } : null);
-    if (data && root.classList.contains('on')) {
+    if (data && (root.classList.contains('on') || root.closest('.res-grouped.on'))) {
       const marks = [...data.writers, ...data.readers].map(x => ({ layer: x.layer, n: x.n, sign: x.act < 0 ? '-' : '+', w: 0.9 }));
       map.setMarks(marks, new Set(marks.map(x => x.layer)));
     }
@@ -103,7 +108,7 @@ export function initResidualPanel(root, { api, t, esc, map, arch, onToken, onPic
       <details><summary>${t('res.signedDimensions')}</summary>${dimensions(v)}
       <label>${t('res.inspectDim')} <input data-res-dim type="number" min="0" max="${d.hidden - 1}" value="${dimension}"></label><div data-res-values class="mono"></div></details>
       <button class="res-action" data-action="export">${t('res.export')}</button>
-      <button class="res-action" data-action="intervene">${t('lab.interveneHere')}</button></div>
+      ${onIntervene ? `<button class="res-action" data-action="intervene">${t('lab.interveneHere')}</button>` : ""}</div>
       <div class="res-section"><div class="lab">${t('res.updates')}</div>
       <p>${t('res.attentionUpdate')} ‖Δr‖ ${d.updates.attention.norm.toPrecision(5)}</p>
       <details><summary>${t('res.signedDimensions')}</summary>${dimensions(d.updates.attention)}</details>
@@ -145,6 +150,7 @@ export function initResidualPanel(root, { api, t, esc, map, arch, onToken, onPic
     busy = false; render();
   }
   function update(inf) {
+    if (grouped) return;
     const old = capture;
     capture = inf?.capture && inf.text ? { capture: inf.capture, pos: inf.pos, text: inf.text, tokens: inf.tokens, positions: inf.positions } : null;
     if (capture) {
@@ -154,16 +160,66 @@ export function initResidualPanel(root, { api, t, esc, map, arch, onToken, onPic
     if (old?.capture !== capture?.capture || old?.pos !== capture?.pos) load();
   }
   render();
-  return { update, render, selectLayer,
+  function updateGroup(rows) {
+    grouped = rows !== null;
+    if (rows === null || !rows.length) pendingGroupTokens.clear();
+    root.classList.toggle('res-grouped', grouped);
+    let container = root.querySelector(':scope > [data-res-group]');
+    if (!grouped) {
+      groupPanels.forEach(panel => panel.clear()); groupPanels = []; groupKey = null;
+      container?.remove(); render(); return;
+    }
+    const key = JSON.stringify(rows.map(row => [row.capture, row.residual.layer, row.residual.selected.n]));
+    if (key === groupKey && container) return;
+    groupPanels.forEach(panel => panel.clear()); groupPanels = []; groupTokenHandlers = []; groupKey = key; mapIndex = 0;
+    container?.remove(); container = document.createElement('div'); container.dataset.resGroup = '';
+    root.append(container); map.setResidualTrace(null);
+    container.innerHTML = `<p class="frequency-note">${t('context.residualHint')}</p>`;
+    if (!rows.length) { container.insertAdjacentHTML('beforeend', `<p>${t('results.commonPending')}</p>`); return; }
+    rows.forEach((row, index) => {
+      const section = document.createElement('details'); section.open = true;
+      section.className = 'context-text';
+      section.innerHTML = `<summary>${esc(t('lab.text', { name: row.label }))} · ${esc(row.residual.token)}</summary><p class="context-excerpt">${esc(row.text)}</p><div class="context-residual-body"></div>`;
+      container.append(section);
+      const inf = { ...row, pos: row.residual.pos };
+      const localMap = new Proxy(map, { get(target, key) {
+        if (key === 'setResidualTrace' || key === 'setMarks') return (...args) => { if (index === mapIndex) target[key](...args); };
+        const value = target[key]; return typeof value === 'function' ? value.bind(target) : value;
+      } });
+      let panel;
+      const read = async (path, body) => {
+        if (!path.startsWith('/api/infer/residual')) return api(path, body);
+        const params = new URL(path, 'http://local').searchParams;
+        if (path.startsWith('/api/infer/residual/export')) return api('/api/infer/contexts/export', { text: row.text, pos: Number(params.get('pos')) });
+        const layer = Number(params.get('layer')), n = Number(params.get('n')), pos = Number(params.get('pos'));
+        if (layer === row.residual.layer && n === row.residual.selected.n && pos === row.residual.pos) return row.residual;
+        const result = await api('/api/infer/contexts', { texts: [row.text], layer, n, pos });
+        if (!result.ready) throw new Error(t('results.commonPending'));
+        return result.contexts[0].residual;
+      };
+      panel = initResidualPanel(section.querySelector('.context-residual-body'), { ...options, api: read, map: localMap,
+        onToken: pos => { inf.pos = pos; panel.update(inf); },
+        onIntervene: undefined });
+      groupPanels.push(panel);
+      groupTokenHandlers.push(pos => { mapIndex = index; inf.pos = pos; panel.update(inf); });
+      section.addEventListener('pointerdown', () => { mapIndex = index; panel.showOnMap(); });
+      if (pendingGroupTokens.has(index) && row.positions.includes(pendingGroupTokens.get(index))) inf.pos = pendingGroupTokens.get(index);
+      panel.focus(row.residual.layer, row.residual.selected.n); panel.update(inf);
+    });
+  }
+  return { update, updateGroup, render, selectLayer,
+    showOnMap() { syncMap(); },
+    selectTextToken(index, pos) { pendingGroupTokens.set(index, pos); groupTokenHandlers[index]?.(pos); },
     selectDimension(l, nextStage, dim) {
+      if (grouped) { groupPanels[mapIndex]?.selectDimension(l, nextStage, dim); return; }
       if (Number.isInteger(dim)) {
         dimension = dim; windowStart = Math.floor(dim / 64) * 64;
       }
       if (data && layer === l) { stage = nextStage; render(); }
       else selectLayer(l, nextStage);
     },
-    focus(l, n) { layer = l; neuron = n; if (capture) load(); },
-    clear() { capture = null; data = null; error = null; busy = false; ++generation; render(); },
+    focus(l, n) { if (grouped) return; layer = l; neuron = n; if (capture) load(); },
+    clear() { if (grouped) updateGroup(null); capture = null; data = null; error = null; busy = false; ++generation; render(); },
     retry() { load(); },
   };
 }

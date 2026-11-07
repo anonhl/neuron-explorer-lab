@@ -44,6 +44,7 @@
   let loading = false;
   let inputPieces = [];
   let residualCapture = "";
+  const cachedInputs = new Map();
 
 
   function simulatedResidual(pos, layer, neuron) {
@@ -61,7 +62,7 @@
     });
     const n=neuron>=0?neuron:featured[0], act=rawActivation(layer,n,inputPieces[pos]||'',pos);
     const lens=lensFor(layer,n), row=all[layer];
-    const tokenRows=(words,sg=1)=>words.slice(0,8).map((token,i)=>({id:i,token,score:sg*(.42-i*.04)}));
+    const tokenRows=(words,sg=1)=>words.slice(0,8).map((token,i)=>({id:hash(token),token,score:sg*(.42-i*.04)}));
     const write=vec(Array.from({length:2560},(_,i)=>act*Math.sin(i*.17+n)*.012));
     write.tokens={positive:tokenRows(lens.up),negative:tokenRows(lens.down,-1)};
     return {ready:true,capture:residualCapture,pos,token:inputPieces[pos],layer,hidden:2560,batch:selectedBatch(),
@@ -658,9 +659,36 @@
           "domains+": [{ domain: "demo_text", lift: 2.2 }], "domains-": [{ domain: "demo_text", lift: 1.7 }],
         });
       }
-      case "/api/infer":
-        inputPieces = pieces(body.text); residualCapture = uid();
+      case "/api/infer": {
+        if (!cachedInputs.has(body.text)) cachedInputs.set(body.text, { tokens: pieces(body.text), capture: uid() });
+        const cached = cachedInputs.get(body.text);
+        inputPieces = cached.tokens; residualCapture = cached.capture;
+        if (body.texts) for (const text of cachedInputs.keys()) if (!body.texts.includes(text)) cachedInputs.delete(text);
         return json({ ready: true, capture: residualCapture, tokens: inputPieces, pos: inputPieces.map((_, i) => i) });
+      }
+      case "/api/infer/cached-texts": return json({ texts: body.texts.map((text, index) => {
+        const cached = cachedInputs.get(text);
+        return { text, index, ready: !!cached, tokens: cached?.tokens ?? [], positions: cached?.tokens.map((_, i) => i) ?? [] };
+      }) });
+      case "/api/infer/contexts":
+      case "/api/infer/contexts/export": {
+        const texts = body.texts || [body.text];
+        if (texts.some(text => !cachedInputs.has(text))) return json({ ready: false, contexts: [], message: 'results.commonPending' });
+        const savedPieces = inputPieces, savedCapture = residualCapture;
+        try {
+          const contexts = texts.map((text, index) => {
+            const cached = cachedInputs.get(text); inputPieces = cached.tokens; residualCapture = cached.capture;
+            const layer = Number(body.layer || 0), n = Number(body.n ?? -1);
+            const pos = Number(body.pos ?? -1) >= 0 ? Number(body.pos) : n < 0 ? inputPieces.length - 1
+              : inputPieces.reduce((best, token, i) => Math.abs(rawActivation(layer, n, token, i)) > Math.abs(rawActivation(layer, n, inputPieces[best], best)) ? i : best, 0);
+            const residual = simulatedResidual(pos, layer, n);
+            if (path.endsWith('/export')) return { text, pos, layers: residual.exportLayers };
+            delete residual.exportLayers;
+            return { text, index, capture: residualCapture, pos, tokens: inputPieces, positions: inputPieces.map((_, i) => i), residual };
+          });
+          return json(path.endsWith('/export') ? contexts[0] : { ready: true, contexts });
+        } finally { inputPieces = savedPieces; residualCapture = savedCapture; }
+      }
       case "/api/infer/residual": {
         if (p.get('capture') !== residualCapture) return json({error:'请重新运行文本。'},409);
         const result=simulatedResidual(pos,layer,p.has('n')?Number(p.get('n')):-1);delete result.exportLayers;return json(result);

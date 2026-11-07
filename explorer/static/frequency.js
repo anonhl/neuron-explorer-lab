@@ -80,7 +80,7 @@ function frequencyMarkup(t, lang, esc) {
   };
   const table = (head, rows) => `<div class="frequency-scroll"><table class="dtable frequency-table"><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table></div>`;
   const th = (key, numeric = false) => `<th scope="col"${numeric ? ' class="num"' : ""}>${label(key)}</th>`;
-  const lensSection = (lens, error, { renderToken = tokenLabel, showTotal = false } = {}) => {
+  const lensSection = (lens, error, { renderToken = tokenLabel, showTotal = false, hintKey = "lensHint" } = {}) => {
     const lensCell = ({ count, positive }, total) => `<td class="num">${countShare(count, total, showTotal)}${poleShares(count, positive)}</td>`;
     let tokens;
     if (lens?.rows.length) {
@@ -97,14 +97,14 @@ function frequencyMarkup(t, lang, esc) {
     } else {
       tokens = message(error ? "lensError" : lens ? "noLens" : "loading");
     }
-    return `<h2>${label("lens")}</h2>${message("lensHint")}${tokens}`;
+    return `<h2>${label("lens")}</h2>${message(hintKey)}${tokens}`;
   };
   return { share, tokenLabel, label, message, countCell, poleShares, sourceToken, table, th, lensSection };
 }
 
-export function lensFrequencyHTML({ connections, error }, { t, lang, esc }) {
+export function lensFrequencyHTML({ connections, error, contextual = false }, { t, lang, esc }) {
   const { lensSection } = frequencyMarkup(t, lang, esc);
-  return lensSection(connections ? countLens(connections) : null, error, { showTotal: true });
+  return lensSection(connections ? countLens(connections) : null, error, { showTotal: true, hintKey: contextual ? "contextLensHint" : "lensHint" });
 }
 
 export function initFrequencyPanel(root, { t, getLang, esc, lookupTokens, openNeuron, copyNeuronButtonHTML, copyNeuronId }) {
@@ -195,7 +195,7 @@ export function initFrequencyPanel(root, { t, getLang, esc, lookupTokens, openNe
   });
 
   return {
-    render({ neuron, replies, connections, error }) {
+    render({ neuron, replies, connections, error, contextual = false }) {
       if (focus !== neuron) {
         focus = neuron;
         selected = null;
@@ -210,10 +210,29 @@ export function initFrequencyPanel(root, { t, getLang, esc, lookupTokens, openNe
       connectionError = error;
       const wordTable = words.rows.length ? table(th("word") + th("countShare", true), words.rows.map((row, i) =>
         `<tr><td>${button("word", i, row, `<bdi>${esc(row.text)}</bdi>`)}</td>${countCell(row.count, words.total)}</tr>`).join("")) : message("noText");
-      root.innerHTML = `<section><h2>${label("text")}</h2>${message("textHint")}${wordTable}</section>
+      root.innerHTML = `<section><h2>${label("text")}</h2>${message(contextual ? "contextTextHint" : "textHint")}${wordTable}</section>
         <section id="frequency-selection" aria-live="polite"></section>
-        <section>${lensSection(lens, error, { renderToken: (row, i) => button("token", i, row, tokenLabel(row)) })}</section>`;
+        <section>${lensSection(lens, error, { renderToken: (row, i) => button("token", i, row, tokenLabel(row)), hintKey: contextual ? "contextLensHint" : "lensHint" })}</section>`;
       renderSelection();
     },
   };
+}
+
+// Each text contributes its own cached readout, even when token labels overlap.
+export function contextFrequency(contexts) {
+  const connections = { up: [], down: [] };
+  const replies = [];
+  for (const row of contexts) {
+    const d = row.residual, selected = d.selected;
+    replies.push({ text: row.text, prompt: row.label, source: "inputText", condition: "observed" });
+    const source = { layer: selected.layer, n: selected.n };
+    const input = d.stages.pre.tokens;
+    connections.up.push({ ...source, sign: 1, lens: input.map(t => t.token), lens_ids: input.map(t => t.id) });
+    for (const [side, sign] of [["positive", 1], ["negative", -1]]) {
+      const tokens = selected.write.tokens[side];
+      connections.down.push({ ...source, sign, lens: tokens.map(t => t.token), lens_ids: tokens.map(t => t.id),
+        lens_neg: tokens.map(t => t.token), lens_neg_ids: tokens.map(t => t.id) });
+    }
+  }
+  return { connections, replies };
 }

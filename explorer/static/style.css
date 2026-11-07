@@ -624,3 +624,12 @@ tr.con .logit .tok { font-size: 10.5px; }
 
 .inf-common-option { display: flex; align-items: center; gap: 6px; padding: 0 10px 8px; font-size: 12px; cursor: pointer; }
 .inf-common-option input[type=checkbox] { width: auto; margin: 0; accent-color: var(--link); }
+
+.res-grouped > :not([data-res-group]) { display: none !important; }
+.context-text { margin: 12px 0; padding: 10px; border: 1px solid var(--line); border-radius: 6px; }
+.context-text h4 { margin: 0 0 6px; }
+.context-text > summary { cursor: pointer; font-weight: 600; }
+.context-excerpt { max-height: 6em; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; color: var(--dim); font-size: 12px; }
+
+.inf-token-group + .inf-token-group { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--line); }
+.inf-token-group .lab { margin-bottom: 4px; }

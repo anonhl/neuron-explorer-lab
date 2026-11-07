@@ -4,7 +4,7 @@ import { initResidualLab } from "./residual-lab.js?v=1";
 import { createScatter } from "./scatter.js?v=39";
 import { t, tp, getLang, localizeError, applyTranslations } from "./i18n.js?v=24";
 import { initNeuronBatches } from "./neuron-batches.js?v=18";
-import { initFrequencyPanel, lensFrequencyHTML } from "./frequency.js?v=4";
+import { initFrequencyPanel, lensFrequencyHTML, contextFrequency } from "./frequency.js?v=4";
 
 const $ = s => document.querySelector(s);
 const api = async (p, body) => {
@@ -78,6 +78,7 @@ const batchPanel = initNeuronBatches({
   onApplied: () => {
     residualPanel.clear();
     residualLab.invalidate();
+    groupContextRequests.clear(); groupContexts = null; groupContextKey = null; ++groupContextGeneration;
     // Live captures and text heatmaps belong to the configuration that produced them.
     ++qGen; ++viewGen; ++headsGen; ++shadeGen;
     state.inf = { ...state.inf, text: null, pos: -1, tokens: null, pending: false };
@@ -408,14 +409,17 @@ async function runInfer(text, g) {
     if (!r.ready) { $("#run-rows").innerHTML = `<li class="head">${esc(localizeStatus(state.statusText) || t("results.measuring"))}</li>`; return; }
     state.inf = { ...state.inf, text, pos: -1, tokens: r.tokens, positions: r.pos, capture: r.capture };
     residualPanel.update(state.inf); markLeftFresh("residual");
-    $("#inf-toks").innerHTML = r.tokens.map((t, i) => `<button data-i="${r.pos[i]}">${esc(t)}</button>`).join("");
+    if (!commonMode) $("#inf-toks").innerHTML = r.tokens.map((t, i) => `<button data-i="${r.pos[i]}">${esc(t)}</button>`).join("");
   }
+  renderRunTokens();
   await inferView(g);
+  refreshGroupContexts();
 }
 // hovering a token previews it: its strongest neurons marked on the map, and the direct links among them as the web;
 // clicking pins it; leaving the tokens goes back to the pinned token (or none) and the open neuron's web
 let tokHover = null, tokTimer;
 async function showTokenPaths(pos) {
+  if (commonMode) { webKey = null; return refreshWeb(); }
   if (pos < 0) { webKey = null; return refreshWeb(); }
   if (leftTab !== "run") return;
   const r = await fetch(`/api/infer/paths?pos=${pos}&min=${$("#inf-min").value || 1}`);
@@ -433,7 +437,7 @@ function previewToken(pos) {
 let headsGen = 0;
 async function lightHeads(pos) {
   const g = ++headsGen, f = state.focus;
-  const on = leftTab === "run" && state.inf.text && pos >= 0;
+  const on = !commonMode && leftTab === "run" && state.inf.text && pos >= 0;
   const r = on ? await api(`/api/infer/heads?pos=${pos}`) : null;
   if (g !== headsGen) return;
   if (r?.layers) map.setHeadLevels(r.layers.map(row => row.map(v => Math.max(0, (v - 0.15) / 0.6))));
@@ -457,16 +461,25 @@ async function shadeTokens(pos) {
   });
 }
 $("#inf-toks").addEventListener("pointerover", e => {
+  if (commonMode) return;
   const b = e.target.closest("button"); if (!b || tokHover === +b.dataset.i) return;
   tokHover = +b.dataset.i; clearTimeout(tokTimer);
   tokTimer = setTimeout(() => previewToken(tokHover), 90);
 });
 $("#inf-toks").addEventListener("pointerleave", () => {
+  if (commonMode) return;
   clearTimeout(tokTimer); tokHover = null;
   inferView(); showTokenPaths(state.inf.pos); lightHeads(state.inf.pos);
 });
 $("#inf-toks").addEventListener("click", e => {
   const b = e.target.closest("button"); if (!b) return;
+  if (commonMode) {
+    const index = Number(b.dataset.textIndex), pos = Number(b.dataset.i);
+    residualPanel.selectTextToken(index, pos);
+    const group = b.closest('.inf-token-group');
+    group?.querySelectorAll('button').forEach(button => button.classList.toggle('on', button === b));
+    return;
+  }
   state.inf.pos = state.inf.pos === +b.dataset.i ? -1 : +b.dataset.i;
   residualPanel.update(state.inf);
   document.querySelectorAll("#inf-toks button").forEach(x => x.classList.toggle("on", +x.dataset.i === state.inf.pos));
@@ -476,6 +489,7 @@ document.querySelectorAll("#inf-sign button").forEach(b => b.onclick = () => {
   state.inf.sign = b.dataset.s;
   document.querySelectorAll("#inf-sign button").forEach(x => x.classList.toggle("on", x === b));
   inferView();
+  if (commonMode) refreshGroupContexts();
 });
 let infTimer;
 for (const id of ["#inf-lo", "#inf-hi", "#inf-min", "#inf-q"]) $(id).addEventListener("input", () => { clearTimeout(infTimer); infTimer = setTimeout(inferView, 200); });
@@ -484,11 +498,92 @@ $("#inf-addresses").addEventListener("input", () => {
   clearTimeout(infTimer);
   infTimer = setTimeout(() => inferView(qGen, tokHover ?? state.inf.pos), 200);
 });
+let runTokensGeneration = 0;
+async function renderRunTokens() {
+  const generation = ++runTokensGeneration;
+  const target = $("#inf-toks");
+  clearTimeout(tokTimer); tokHover = null;
+  if (!commonMode) {
+    target.innerHTML = (state.inf.tokens ?? []).map((token, i) => `<button data-i="${state.inf.positions[i]}" class="${state.inf.positions[i] === state.inf.pos ? 'on' : ''}">${esc(token)}</button>`).join("");
+    return;
+  }
+  const inputs = residualLab.getInputs();
+  target.innerHTML = `<p class="frequency-note">${t('results.commonPending')}</p>`;
+  try {
+    const result = await api('/api/infer/cached-texts', { texts: inputs.map(row => row.text) });
+    if (generation !== runTokensGeneration || !commonMode) return;
+    target.innerHTML = result.texts.map((row, index) => `<section class="inf-token-group"><div class="lab">${esc(t('lab.text', { name: inputs[index].label }))}</div>
+      ${row.ready ? row.tokens.map((token, i) => `<button data-text-index="${index}" data-i="${row.positions[i]}">${esc(token)}</button>`).join('') : `<span class="dim">${t('results.commonPending')}</span>`}</section>`).join('');
+  } catch (error) {
+    if (generation === runTokensGeneration) target.innerHTML = `<p>${esc(localizeError(error))}</p>`;
+  }
+}
+let groupContexts = null, groupContextKey = null, groupContextGeneration = 0, groupContextError = null;
+const groupContextRequests = new Map();
+function contextRows() {
+  return groupContexts ?? [];
+}
+async function refreshGroupContexts() {
+  const generation = ++groupContextGeneration;
+  if (!commonMode) {
+    groupContexts = null; groupContextKey = null; groupContextError = null;
+    residualPanel.updateGroup(null); residualPanel.update(state.inf);
+    if (state.unit) { renderDetails(state.unit); renderLensDetails(); renderConnections(); }
+    renderFrequency();
+    return;
+  }
+  const texts = residualLab.getTexts(), focus = state.focus;
+  const layer = focus?.kind === "neuron" ? focus.layer : 0;
+  const n = focus?.kind === "neuron" ? focus.n : -1;
+  const key = JSON.stringify([texts, layer, n, state.inf.sign]);
+  if (groupContextKey === key && groupContexts) { residualPanel.updateGroup(groupContexts); renderGroupDetails(); renderFrequency(); return; }
+  groupContextKey = key; groupContexts = null; groupContextError = null;
+  if (state.unit) { renderDetails(state.unit); renderLensDetails(); renderConnections(); }
+  residualPanel.updateGroup([]);
+  renderGroupDetails(); renderDetailsFrequency(); renderFrequency();
+  if (texts.length < 2 || texts.some(text => !text.trim())) return;
+  try {
+    if (!groupContextRequests.has(key)) {
+      const request = api("/api/infer/contexts", { texts, layer, n, sign: state.inf.sign });
+      groupContextRequests.set(key, request);
+      if (groupContextRequests.size > 16) groupContextRequests.delete(groupContextRequests.keys().next().value);
+    }
+    const result = await groupContextRequests.get(key);
+    if (generation !== groupContextGeneration || !commonMode) return;
+    if (!result.ready) { groupContextRequests.delete(key); return; }
+    groupContexts = result.contexts.map((row, i) => ({ ...row,
+      label: residualLab.getInputs()[i]?.label ?? String.fromCharCode(65 + i) }));
+    residualPanel.updateGroup(groupContexts);
+  } catch (error) {
+    groupContextRequests.delete(key);
+    if (generation !== groupContextGeneration) return;
+    groupContextError = error;
+  }
+  renderGroupDetails(); renderDetailsFrequency(); renderFrequency();
+}
+function renderGroupDetails() {
+  const el = $("#d-contexts");
+  if (!el) return;
+  el.hidden = !commonMode;
+  if (!commonMode) { el.replaceChildren(); return; }
+  const tokens = rows => rows.map(row => `<span class="tok" title="${esc(String(row.score))}">${esc(row.token)}</span>`).join("");
+  el.innerHTML = `<h3>${t("context.title", { n: contextRows().length })}</h3><p class="frequency-note">${t("context.hint")}</p>` +
+    (groupContextError ? `<p>${esc(localizeError(groupContextError))}</p>` : !groupContexts ? `<p>${t("results.commonPending")}</p>` :
+    contextRows().map(row => { const d = row.residual, s = d.selected;
+      return `<section class="context-text"><h4>${esc(t("lab.text", { name: row.label }))} · ${t("results.activation", { value: Number(s.act.toPrecision(4)) })}</h4>
+        <p class="context-excerpt">${esc(row.text)}</p><p class="dim">token #${d.pos}: ${esc(d.token)} · ${Number(s.score.toPrecision(4))}×</p>
+        <div class="lens"><div><div class="lab">${t("context.input")}</div>${tokens(d.stages.pre.tokens)}</div>
+        <div><div class="lab">${t("context.output")}</div><div class="up">${tokens(s.write.tokens.positive)}</div><div class="down">${tokens(s.write.tokens.negative)}</div></div></div></section>`;
+    }).join(""));
+}
 let commonMode = false;
 const commonCheckbox = $("#inf-common");
 commonCheckbox.onchange = () => {
   commonMode = commonCheckbox.checked;
+  lightHeads(state.inf.pos); showTokenPaths(state.inf.pos);
+  renderRunTokens();
   inferView();
+  refreshGroupContexts();
 };
 let viewGen = 0;
 async function inferView(g = qGen, pos = state.inf.pos) {
@@ -848,6 +943,7 @@ async function openNeuron(layer, n, kind = "neuron", push = true, fly = true) {
   if (!agentSelecting) clearAgentMarks();
   flushName();
   state.focus = { layer, n, kind }; state.unit = null;
+  if (commonMode) refreshGroupContexts();
   if (kind === "neuron") residualPanel.focus(layer, n);
   syncListSelection();
   state.lens = null; state.con = null; state.lensError = null; state.conError = null;
@@ -955,28 +1051,38 @@ $("#tab-examples").addEventListener("click", e => { const c = e.target.closest("
 function renderDetails(u) {
   const s = u.stats;
   let h = "";
-  if (s) {
+  if (s && !commonMode) {
     h += `<div class="lab">${t("details.words")}</div><div class="crumbs">` + s.words.map(([w, c, z]) =>
       `<span class="tok" title="${esc(t("details.rollouts", { n: c, z: z.toFixed(1), prompts: (s.per_prompt[w] || []).join(" ") }))}">${esc(w)}</span>`).join("") + `</div>`;
     h += `<table class="dtable"><tr><th class="num">${t("details.dose")}</th><th class="num">${t("details.push")}</th><th class="num">${t("details.distinct")}</th><th class="num">${t("details.capped")}</th><th class="num">${t("details.logprob")}</th></tr>` +
       Object.entries(s.dose).map(([d, v]) => `<tr><td class="num">${d}</td><td class="num">${v.rel_push.toFixed(2)}</td><td class="num">${v.distinct4.toFixed(2)}</td><td class="num">${(v.capped * 100).toFixed(0)}%</td><td class="num">${v.logprob.toFixed(2)}</td></tr>`).join("") + `</table>`;
   }
-  h += `<div id="d-lens" class="slot">—</div>`;
+  h += `<section id="d-contexts" hidden></section>`;
+  h += `<div id="d-lens" class="slot" ${commonMode ? "hidden" : ""}>—</div>`;
   if (u.kind === "neuron") h += `<section id="d-frequency"></section>`;
-  h += `<div class="lab" style="margin-top:18px">${t("details.connections")}</div><div id="d-con" class="slot">—</div>`;
+  if (!commonMode) h += `<div class="lab" style="margin-top:18px">${t("details.connections")}</div><div id="d-con" class="slot">—</div>`;
   $("#tab-details").innerHTML = h;
+  renderGroupDetails();
   renderDetailsFrequency();
 }
 
 function renderDetailsFrequency() {
   const el = $("#d-frequency");
   if (!el) return;
-  el.innerHTML = lensFrequencyHTML({ connections: state.con, error: state.conError }, { t, lang: getLang(), esc });
+  const combined = commonMode ? contextFrequency(contextRows()).connections : state.con;
+  el.innerHTML = (commonMode ? `<p class="frequency-note">${t("context.frequencyHint")}</p>` : "") +
+    lensFrequencyHTML({ connections: combined, contextual: commonMode, error: commonMode ? groupContextError : state.conError }, { t, lang: getLang(), esc });
 }
 
 function renderFrequency() {
   const neuron = state.focus;
   if (curTab() !== "frequency" || neuron?.kind !== "neuron") return;
+  if (commonMode) {
+    const combined = contextFrequency(contextRows());
+    frequencyPanel.render({ neuron, ...combined, contextual: true, error: groupContextError });
+    $("#tab-frequency").insertAdjacentHTML("afterbegin", `<p class="frequency-note">${t("context.frequencyHint")}</p>`);
+    return;
+  }
   const unit = state.unit;
   const rollouts = unit?.rollouts ?? [];
   const prompts = new Set(rollouts.map(row => row.prompt));
@@ -1467,6 +1573,7 @@ document.addEventListener("modelstatuschange", ({ detail: s }) => {
   if (s.switching || s.status === "loading") {
     residualPanel.clear();
     residualLab.invalidate();
+    groupContextRequests.clear(); groupContexts = null; groupContextKey = null; ++groupContextGeneration; ++runTokensGeneration;
     state.inf = { ...state.inf, text: null, capture: null };
   }
   if (s.status !== "server unreachable") batchPanel.syncActive(s.active_batch);

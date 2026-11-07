@@ -280,6 +280,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   }
   render();
   return { render, setActive,
+    getInputs() { return texts.map(({ id, label, text }) => ({ id, label, text })); },
     getTexts() { return texts.map(row => row.text); },
     configure({ layer, n, stage, pos }) {
       if (busy) return;
