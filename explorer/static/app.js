@@ -393,7 +393,7 @@ const stillWanted = (g, mode, q) => g === qGen && state.qMode === mode &&
   (mode === "fires" ? $("#lens-q").value : $("#lens-q").value.trim()) === q;
 async function runInfer(text, g) {
   commonMode = false;
-  $("#inf-common").setAttribute("aria-pressed", "false");
+  $("#inf-common").checked = false;
   residualLab.externalText(text);
   markLeftFresh("run");
   if (text !== state.inf.text) {
@@ -487,10 +487,9 @@ $("#inf-addresses").addEventListener("input", () => {
   infTimer = setTimeout(() => inferView(qGen, tokHover ?? state.inf.pos), 200);
 });
 let commonMode = false;
-const commonButton = $("#inf-common");
-commonButton.onclick = () => {
-  commonMode = !commonMode;
-  commonButton.setAttribute("aria-pressed", String(commonMode));
+const commonCheckbox = $("#inf-common");
+commonCheckbox.onchange = () => {
+  commonMode = commonCheckbox.checked;
   clearTimeout(lensTimer);
   ++qGen;
   inferView();

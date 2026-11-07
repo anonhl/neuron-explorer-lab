@@ -621,3 +621,6 @@ tr.con .logit .tok { font-size: 10.5px; }
   .rl-input-row { grid-template-columns: auto 1fr; }
   .rl-input-row > small { grid-column: 2; }
 }
+
+.inf-common-option { display: flex; align-items: center; gap: 6px; padding: 0 10px 8px; font-size: 12px; cursor: pointer; }
+.inf-common-option input[type=checkbox] { width: auto; margin: 0; accent-color: var(--link); }
