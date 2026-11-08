@@ -35,10 +35,21 @@ Open the right-side **residual stream** tab between Chat and Details and prepare
 | Erase projection | Remove the normalized direction component, with strength 0–1. |
 | Patch state | Replace/blend a target with a source residual at the same layer/stage, strength 0–1. Select source and target token positions independently; matching indices do not imply semantic alignment. Continued patching reuses the same source vector. |
 
-For every input the experiment runs baseline and intervention independently, with fresh caches and deterministic greedy generation. Both include any active neuron batch; only the intervention side receives the residual operation. Results show generated text, next-token probabilities, KL, selected-position activation changes and per-layer residual norms. Candidate answers are one per line and scored across the entire continuation, not only its first token (1–64 tokens each).
+For every input the experiment runs baseline and intervention independently, with fresh caches and deterministic greedy generation. Both include any active neuron batch; only the intervention side receives the residual operation. Results show generated text, next-token probabilities, KL, activation changes at the final prompt position and per-layer residual norms. Each setting's target token position is retained in the export. Candidate answers are one per line and scored across the entire continuation, not only its first token (1–64 tokens each).
 
 Stop an experiment to keep completed groups, or export inputs, settings, model metadata and results as JSON. Changing settings retains old results marked as a previous experiment. Rerun after changing model weights or the active batch. Hooks are scoped to the experiment; weight files are unchanged.
 
 ## Simulated practice
 
 Open `neuron-explorer-demo.html` and choose **simulated mode → multi-text residual comparison** to practice. Its data and replies are browser-generated examples, not Qwen measurements. Rebuild it from current sources with `python explorer/build_demo.py`.
+
+
+## Keep residual interventions in chat
+
+Add neurons by IDs such as `L22 N2742, L23 N100`, or from the map. Each neuron has one independent entry, up to 32; adding the same ID again preserves its settings. Check multiple rows to include them, or select/clear all. Clicking a row edits it without clearing other checked rows. Selected IDs update with the checkboxes. Each entry keeps its own method, layer, neuron, stage, scope, target positions and strength. The text experiment applies all checked entries together; input formatting and generation options are shared.
+
+**Keep residual interventions** snapshots the checked entries for subsequent evaluation and conversation turns, without requiring a map selection. The same button becomes **Stop interventions**; stopping also cancels an active chat reply. Editing settings does not change the held snapshot: stop and enable again to apply edits. Chat status and turn records show the number of held entries.
+
+Only the configured evaluation column receives held residual interventions. The baseline and reversed-neuron columns have none; erasure and replacement are not forcibly inverted. To isolate residual effects, disable temporary neuron adjustments and compare the configured and baseline columns. Any active neuron batch still applies to all three columns. Columns generate separately using fresh caches under the same model configuration. Token scope has a separate absolute target position in the full chat prompt, including template and history. Other scopes adapt to each turn.
+
+Neuron directions, write removal and custom directions need no analysis text; difference directions and state replacement need source texts. Reloading the page or changing model or neuron batch stops holding. This applies to requests from this page, leaves weights unchanged, and does not affect other browser pages. Copy icons beside chat neuron IDs copy the full `Llayer Nneuron` address.

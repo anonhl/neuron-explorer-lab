@@ -326,13 +326,14 @@ async def steer(req: Request):
     try:
         if not isinstance(b, dict):
             raise ValueError("Chat request must be an object.")
+        residuals = validate_held_residuals(b.get("residuals", []))
         group = b.get("group")
         if group not in (None, "evaluation", "conversation"):
             raise ValueError("Unknown chat group.")
         raw_operations = b["operations"] if "operations" in b else [{
             "layer": int(b["layer"]), "n": int(b["n"]), "dose": float(b["dose"]), "mode": b.get("mode", "add"),
         }]
-        operations = [] if group == "conversation" and raw_operations == [] else validate_operations(
+        operations = [] if raw_operations == [] and (group == "conversation" or residuals) else validate_operations(
             raw_operations, ARCH["n_layers"], ARCH["inter"])
         if group == "evaluation" and any(op["dose"] < 0 for op in operations if op["enabled"]):
             raise ValueError("Evaluation doses must be non-negative.")
@@ -350,7 +351,7 @@ async def steer(req: Request):
                 for turn in b.get("history", []):
                     msgs += [{"role": "user", "content": turn["user"]}, {"role": "assistant", "content": turn["replies"][r]}]
                 rows.append(msgs + [{"role": "user", "content": b["prompt"]}])
-            for row, delta in rt.steer_multi(pushes, rows, int(b.get("max_new", 300)), cancel):
+            for row, delta in rt.steer_multi(pushes, rows, int(b.get("max_new", 300)), cancel, **({"residuals": residuals} if residuals else {})):
                 loop.call_soon_threadsafe(q.put_nowait, {"row": row, "t": delta})
         except Exception as e:  # surfaced in the UI next to the chat
             loop.call_soon_threadsafe(q.put_nowait, {"row": None, "error": repr(e)})
@@ -519,6 +520,29 @@ async def residual_tokens(req: Request):
         return JSONResponse({"error": str(exc)}, status_code=400)
 
 
+def validate_held_residuals(items):
+    if not isinstance(items, list) or len(items) > 32:
+        raise ValueError("Provide at most 32 residual interventions.")
+    result = [validate_experiment(item, ARCH["n_layers"], ARCH["hidden"], ARCH["inter"]) for item in items]
+    for item in result:
+        if item["plan"]["scope"] == "token":
+            position = item["plan"].get("chat_position")
+            if isinstance(position, bool) or not isinstance(position, int) or position < 0:
+                raise ValueError("Choose a conversation target token position.")
+    return result
+
+
+@app.post("/api/residual/validate-held")
+async def validate_held_residual_request(req: Request):
+    try:
+        body = await req.json()
+        if not isinstance(body, dict):
+            raise ValueError("Residual request must be an object.")
+        return {"residuals": validate_held_residuals(body.get("residuals"))}
+    except (TypeError, KeyError, ValueError) as exc:
+        return JSONResponse({"error": str(exc)}, status_code=400)
+
+
 @app.post("/api/residual/experiment")
 async def residual_experiment(req: Request):
     try:
@@ -633,11 +657,11 @@ def export_residual(capture: str, pos: int = Query(ge=0)):
 
 @app.get("/api/infer/view")
 async def infer_view(pos: int = -1, sign: str = "both", lo: int = 0, hi: int = 99, min: float = 1.0, q: str = "",
-                     limit: int = 300, addresses: str = ""):
-    return await _infer_view(_infer, pos, sign, lo, hi, min, q, limit, addresses)
+                     limit: int = 300, addresses: str = "", q_all: bool = False):
+    return await _infer_view(_infer, pos, sign, lo, hi, min, q, limit, addresses, q_all=q_all)
 
 
-async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="", limit=300, addresses="", include_map=True):
+async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="", limit=300, addresses="", include_map=True, q_all=False):
     """Neurons passing the filters for the last inferred text. pos = token index, or -1 for the strongest token.
     Exact addresses bypass the ranking filters and preserve input order. The map uses layer-major float16 scores."""
     neurons = []
@@ -672,10 +696,18 @@ async def _infer_view(snapshot, pos=-1, sign="both", lo=0, hi=99, min=1.0, q="",
         if sign == "-": keep &= best < 0
         lay = np.arange(best.shape[0])[:, None]
         keep &= (lay >= lo) & (lay <= hi)
-        if q.strip() and idx is not None:
-            ql = q.strip().lower()
-            match = np.array([i for i, t in enumerate(vocab) if ql in t.lower()], dtype=np.int32)
-            lens_hit = np.where(best[..., None] >= 0, np.isin(idx["up"][:, :, :6], match), np.isin(idx["down"][:, :, :6], match)).any(-1)
+        terms = [term.strip().lower() for term in re.split(r"[,，]", q) if term.strip()]
+        if terms and idx is not None:
+            lens = np.where(best[..., None] >= 0, idx["up"][:, :, :6], idx["down"][:, :, :6])
+            words = [t.lower() for t in vocab]
+            if q_all:
+                lens_hit = np.ones(best.shape, dtype=bool)
+                for term in dict.fromkeys(terms):
+                    match = np.array([i for i, word in enumerate(words) if term in word], dtype=np.int32)
+                    lens_hit &= np.isin(lens, match).any(-1)
+            else:
+                match = np.array([i for i, word in enumerate(words) if any(term in word for term in terms)], dtype=np.int32)
+                lens_hit = np.isin(lens, match).any(-1)
             keep &= lens_hit
         view = np.where(keep, best, 0)
         ls, ns = np.nonzero(keep)
@@ -716,7 +748,8 @@ async def infer_common(req: Request):
     for snapshot in snapshots:
         result = await _infer_view(snapshot,
             sign=b.get("sign", "both"), lo=int(b.get("lo", 0)), hi=int(b.get("hi", 99)),
-            min=float(b.get("min", 1)), q=b.get("q", ""), limit=ARCH["n_layers"] * ARCH["inter"], include_map=False)
+            min=float(b.get("min", 1)), q=b.get("q", ""), q_all=b.get("q_all", False),
+            limit=ARCH["n_layers"] * ARCH["inter"], include_map=False)
         rows = {(r["layer"], r["n"]): r for r in result["results"] if r["score"] > 0}
         if common is None:
             common = rows

@@ -13,6 +13,7 @@ import threading
 import gc
 import hashlib
 from itertools import islice
+from contextlib import ExitStack
 from pathlib import Path
 from uuid import uuid4
 
@@ -835,7 +836,7 @@ class Runtime:
         Yields (row, text_delta), then (None, None)."""
         yield from self.steer_multi([(layer, n, dose, mode)], rows_messages, max_new, cancel)
 
-    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None, temperature=0.0, repetition_penalty=1.0, seed=0, min_p=0.0):
+    def steer_multi(self, pushes, rows_messages, max_new=200, cancel=None, temperature=0.0, repetition_penalty=1.0, seed=0, min_p=0.0, residuals=None):
         """Apply pushes = [(layer, n, dose, mode)] together. One conversation uses the given doses. Three rows compare
         the given doses, the baseline and the reversed doses (add: -dose; mul: x -dose). Greedy by default; with
         temperature > 0 each row samples from its own generator seeded with `seed` (so a run repeats exactly), keeping
@@ -845,9 +846,28 @@ class Runtime:
         row_count = len(rows_messages)
         if row_count not in (1, 3):
             raise ValueError("Steering requires one conversation or three comparison rows.")
+        if residuals and row_count == 3:
+            # Independent caches avoid padding-dependent token coordinates for scoped interventions.
+            self.ensure_loaded()
+            with self.lock:
+                for row, sign in enumerate((1, 0, -1)):
+                    signed = [(l, n, d * sign if mode == "add" else (d if sign == 1 else 1 if sign == 0 else -d), mode)
+                              for l, n, d, mode in pushes]
+                    # Only the configured column receives held residual edits. The baseline and
+                    # reversed-neuron column let users isolate their effect without reversing
+                    # non-invertible erasure/replacement operations.
+                    row_residuals = residuals if row == 0 else None
+                    for _, delta in self.steer_multi(signed, [rows_messages[row]], max_new, cancel,
+                                                     temperature, repetition_penalty, seed, min_p, row_residuals):
+                        if delta is not None:
+                            yield row, delta
+                    if cancel is not None and cancel.is_set():
+                        break
+            yield None, None
+            return
         row_signs = (1, 0, -1)[:row_count]
         self.ensure_loaded()
-        with self.lock:
+        with self.lock, ExitStack() as residual_stack:
             if cancel is not None and cancel.is_set():
                 yield None, None
                 return
@@ -867,6 +887,21 @@ class Runtime:
                     seen = torch.zeros(row_count, self.model.lm_head.out_features, dtype=torch.bool, device=self.dev)
                     for r, q in enumerate(seqs):
                         seen[r, torch.tensor(q, device=self.dev)] = True
+                residual_hooks = []
+                if residuals:
+                    if __package__:
+                        from .residual_interventions import ResidualHooks, prepare_chat_residual
+                    else:
+                        from residual_interventions import ResidualHooks, prepare_chat_residual
+                    with torch.inference_mode():
+                        vectors = [prepare_chat_residual(self, body) for body in residuals]
+                    for body, vector in reversed(list(zip(residuals, vectors))):
+                        plan = body["plan"]
+                        position = plan["chat_position"] if plan["scope"] == "token" else T - 1
+                        if not 0 <= position < T:
+                            raise ValueError("Residual target token is outside the conversation prompt.")
+                        residual_hooks.append(residual_stack.enter_context(
+                            ResidualHooks(self, {**plan, "enabled": True}, T, position, vector, observe=False)))
                 self._push = push
                 with torch.inference_mode():
                     out = self.model(input_ids=ids, attention_mask=mask, position_ids=pos, use_cache=True,
@@ -906,6 +941,8 @@ class Runtime:
                             break
                         mask = torch.cat([mask, torch.ones_like(mask[:, :1])], -1)
                         pos = pos[:, -1:] + 1
+                        for hooks in residual_hooks:
+                            hooks.offset = T + len(out_ids[0]) - 1
                         out = self.model(input_ids=nxt[:, None], attention_mask=mask, position_ids=pos,
                                          past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
             finally:

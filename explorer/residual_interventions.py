@@ -1,6 +1,6 @@
-"""Scoped, causal residual experiments. No weights or persistent runtime hooks are changed."""
+"""Scoped residual experiments and held chat interventions; model weights are unchanged."""
 import math
-from contextlib import AbstractContextManager
+from contextlib import AbstractContextManager, ExitStack
 
 import torch
 import torch.nn.functional as F
@@ -14,6 +14,13 @@ MAX_TOKENS = 1024
 def validate_experiment(body, layers, hidden, inter):
     if not isinstance(body, dict):
         raise ValueError("Experiment must be an object.")
+    if "plans" in body:
+        plans = body["plans"]
+        if not isinstance(plans, list) or not 1 <= len(plans) <= 32 or any(not isinstance(p, dict) for p in plans):
+            raise ValueError("Provide between 1 and 32 residual settings.")
+        shared = {k: v for k, v in body.items() if k not in ("plan", "plans")}
+        checked = [validate_experiment({**shared, "plan": p}, layers, hidden, inter) for p in plans]
+        return {**checked[0], "plans": [item["plan"] for item in checked]}
     texts = body.get("texts")
     if not isinstance(texts, list) or not 1 <= len(texts) <= MAX_TEXTS:
         raise ValueError("Provide between 1 and 8 input texts.")
@@ -168,6 +175,8 @@ class ResidualHooks(AbstractContextManager):
         try:
             neuron_direction = rt.down_col(chosen, p["neuron"]).detach() if p.get("component") == "neuron" else None
             for i, layer in enumerate(rt.lm.layers):
+                if not self.observe and i != chosen:
+                    continue
                 def pre_hook(mod, args, kwargs, i=i):
                     h = kwargs.get("hidden_states", args[0] if args else None)
                     if i == chosen:
@@ -248,42 +257,34 @@ def run_experiment(rt, body, cancel):
     with rt.lock, torch.inference_mode():
         rt.ensure_loaded()
         p = body["plan"]
+        plans = body.get("plans", [p])
         rows = tokenize_texts(rt, body["texts"], body.get("chat", False))
         by_id = {r["id"]: r for r in rows}
-        for row in rows:
-            if p["scope"] == "token" and p["positions"][row["id"]] >= len(row["ids"]):
-                raise ValueError(f"Target token is outside text {row['id']}.")
-        vector = None
-        def capture(text_id, pos):
-            row = by_id[text_id]
-            pos = len(row["ids"]) - 1 if pos == -1 else pos
-            if not 0 <= pos < len(row["ids"]):
-                raise ValueError("Source token is outside the selected source text.")
-            with ResidualHooks(rt, {**p, "enabled": False}, len(row["ids"]), pos, observe=False) as hooks:
-                rt.lm(input_ids=torch.tensor([row["ids"]], device=rt.dev), use_cache=False)
-            return hooks.stages[p["stage"]]
-        if cancel.is_set():
-            return
-        if p["method"] == "patch":
-            vector = capture(p["source"], p["source_pos"])
-        elif p["method"] != "remove":
-            if p["direction"] == "neuron":
-                vector = rt.down_col(p["layer"], p["neuron"]).detach().float().cpu()
-            elif p["direction"] == "custom":
-                vector = torch.tensor(p["vector"], dtype=torch.float32)
-            else:
-                vector = capture(p["source"], p["source_pos"]) - capture(p["reference"], p["reference_pos"])
-            if not torch.isfinite(vector).all() or float(vector.norm()) < 1e-12:
-                raise ValueError("Direction is zero or invalid; choose a different direction or source pair.")
-            vector = vector / vector.norm()
+        vectors = []
+        for plan in plans:
+            for row in rows:
+                if plan["scope"] == "token" and plan["positions"][row["id"]] >= len(row["ids"]):
+                    raise ValueError(f"Target token is outside text {row['id']}.")
+            if cancel.is_set():
+                return
+            # Resolve every donor before installing any intervention, using the same tokenized inputs.
+            vectors.append(prepare_chat_residual(rt, {**body, "plan": plan}, rows=by_id))
         eos = {x for x in (rt.tok.eos_token_id, rt.tok.convert_tokens_to_ids("<|im_end|>")) if isinstance(x, int) and x >= 0}
         target_ids = [(text, rt.tok(text, add_special_tokens=False).input_ids) for text in body["targets"]]
         if any(not ids or len(ids) > 64 for _, ids in target_ids):
             raise ValueError("Each target continuation must contain 1 to 64 tokens.")
         def run(row, enabled):
             ids = row["ids"]
-            position = p.get("positions", {}).get(row["id"], len(ids) - 1) if p["scope"] == "token" else len(ids) - 1
-            with ResidualHooks(rt, {**p, "enabled": enabled}, len(ids), position, vector) as hooks:
+            position = len(ids) - 1
+            with ExitStack() as stack:
+                # Observe the next-token prediction position once, after all edits at each layer.
+                # Per-setting token positions are used only to target the edits.
+                observers = stack.enter_context(ResidualHooks(rt, {**p, "enabled": False}, len(ids), position))
+                hooks = []
+                for plan, vector in reversed(list(zip(plans, vectors))):
+                    target = plan["positions"][row["id"]] if plan["scope"] == "token" else position
+                    hooks.append(stack.enter_context(ResidualHooks(
+                        rt, {**plan, "enabled": enabled}, len(ids), target, vector, observe=False)))
                 out = rt.model(input_ids=torch.tensor([ids], device=rt.dev), use_cache=True, logits_to_keep=1)
                 lp = out.logits[0, -1].float().log_softmax(-1).cpu()
                 if not torch.isfinite(lp).all():
@@ -299,16 +300,18 @@ def run_experiment(rt, body, cancel):
                         break
                     generated.append(token)
                     if step + 1 < body["max_new"]:
-                        hooks.offset = len(ids) + len(generated) - 1
+                        for hook in [observers, *hooks]:
+                            hook.offset = len(ids) + len(generated) - 1
                         out = rt.model(input_ids=torch.tensor([[token]], device=rt.dev),
                                        past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
                 # Teacher-force entire target continuations from a fresh prefill/cache per target.
                 targets = []
-                hooks.observe = False
+                observers.observe = False
                 for text, suffix in target_ids:
                     if cancel.is_set():
                         return None
-                    hooks.offset = 0
+                    for hook in [observers, *hooks]:
+                        hook.offset = 0
                     out = rt.model(input_ids=torch.tensor([ids], device=rt.dev), use_cache=True, logits_to_keep=1)
                     score = 0.
                     for k, token in enumerate(suffix):
@@ -317,7 +320,8 @@ def run_experiment(rt, body, cancel):
                             raise ValueError("Model produced non-finite logits; reduce the intervention strength.")
                         score += term
                         if k + 1 < len(suffix):
-                            hooks.offset = len(ids) + k
+                            for hook in [observers, *hooks]:
+                                hook.offset = len(ids) + k
                             out = rt.model(input_ids=torch.tensor([[token]], device=rt.dev),
                                            past_key_values=out.past_key_values, use_cache=True, logits_to_keep=1)
                     targets.append({"text": text, "tokens": len(suffix), "logprob": score})
@@ -326,10 +330,10 @@ def run_experiment(rt, body, cancel):
                           "generated_tokens": len(generated), "targets": targets,
                           "top": [{"id": int(i), "token": rt.tok.decode([int(i)]), "prob": float(v.exp())}
                                   for i, v in zip(top, values)]}
-                return public, lp, hooks.layers, hooks.neurons
+                return public, lp, observers.layers, observers.neurons
         yield {"type": "start", "total": len(rows), "batch": rt.batch_info(),
                "model_key": rt._weight_cache_key("residual"), "compute_dtype": rt.compute_dtype,
-               "quantization": rt.quantization, "lora": rt.lora_path, "plan": p}
+               "quantization": rt.quantization, "lora": rt.lora_path, "plan": p, "plans": plans}
         for row in rows:
             if cancel.is_set():
                 return
@@ -354,10 +358,40 @@ def run_experiment(rt, body, cancel):
                                         "intervened": float(aa[layer][n]), "delta": float(d[n])})
             neurons.sort(key=lambda r: -abs(r["delta"]))
             yield {"type": "result", "id": row["id"], "label": row.get("label", row["id"]), "text": row["text"],
-                   "position": p.get("positions", {}).get(row["id"], len(row["ids"]) - 1) if p["scope"] == "token" else len(row["ids"]) - 1,
+                   "position": len(row["ids"]) - 1,
+                   "positions": [plan["positions"][row["id"]] if plan["scope"] == "token" else len(row["ids"]) - 1 for plan in plans],
                    "input_tokens": len(row["ids"]), "baseline": base, "intervened": alt,
                    "kl": max(0., float((bp.exp() * (bp - ap)).sum())),
                    "changes": [{"token": rt.tok.decode([int(i)]), "baseline": float(bp[i].exp()),
                                 "intervened": float(ap[i].exp()), "delta": float(changes[i])} for i in top],
                    "layers": [{"layer": l, "baseline": bn[l], "intervened": an[l]} for l in sorted(bn)],
                    "neurons": neurons[:16]}
+
+
+def prepare_chat_residual(rt, body, rows=None):
+    """Resolve source vectors before installing generation hooks; caller holds the runtime lock."""
+    p = body["plan"]
+    needs_source = p["method"] == "patch" or p.get("direction") == "difference"
+    if rows is None:
+        rows = {r["id"]: r for r in tokenize_texts(rt, body["texts"], body.get("chat", False))} if needs_source else {}
+    def capture(key, position):
+        ids = rows[key]["ids"]
+        position = len(ids) - 1 if position == -1 else position
+        if not 0 <= position < len(ids):
+            raise ValueError("Source token is outside the selected source text.")
+        with ResidualHooks(rt, {**p, "enabled": False}, len(ids), position, observe=False) as hooks:
+            rt.lm(input_ids=torch.tensor([ids], device=rt.dev), use_cache=False)
+        return hooks.stages[p["stage"]]
+    if p["method"] == "remove":
+        return None
+    if p["method"] == "patch":
+        return capture(p["source"], p["source_pos"])
+    if p["direction"] == "neuron":
+        vector = rt.down_col(p["layer"], p["neuron"]).detach().float().cpu()
+    elif p["direction"] == "custom":
+        vector = torch.tensor(p["vector"], dtype=torch.float32)
+    else:
+        vector = capture(p["source"], p["source_pos"]) - capture(p["reference"], p["reference_pos"])
+    if not torch.isfinite(vector).all() or float(vector.norm()) < 1e-12:
+        raise ValueError("Direction is zero or invalid; choose a different direction or source pair.")
+    return vector / vector.norm()

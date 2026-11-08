@@ -68,6 +68,13 @@ class CommonActivationTests(unittest.IsolatedAsyncioTestCase):
             result = await self.run_request(texts=['a', 'b'])
             self.assertEqual(result['total'], 2)
 
+    async def test_lens_match_mode_is_forwarded_to_every_text(self):
+        await self.run_request(texts=['a', 'b'], q='Cute,Indifferent', q_all=True)
+        self.assertTrue(all(k['q_all'] is True and k['q'] == 'Cute,Indifferent' for k in self.seen))
+        self.seen.clear()
+        await self.run_request(texts=['a', 'b'])
+        self.assertTrue(all(k['q_all'] is False for k in self.seen))
+
     async def test_requires_multiple_filled_texts(self):
         for texts in [['a'], ['a', ' '], ['a'] * 9]:
             self.assertEqual((await self.run_request(texts=texts))[0], 400)

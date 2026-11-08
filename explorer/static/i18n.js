@@ -136,8 +136,9 @@ const en = {
   "list.fromLayer": "from layer",
   "list.toLayer": "to layer",
   "list.minScore": "minimum score",
-  "list.lensHas": "lens has…",
+  "list.lensHas": "tokens, separated by commas…",
   "list.lensFilter": "lens filter",
+  "list.lensAll": "Match all tokens",
 
   "tabs.examples": "Examples",
   "tabs.chat": "Chat",
@@ -524,8 +525,9 @@ const zh = {
   "list.fromLayer": "起始层",
   "list.toLayer": "结束层",
   "list.minScore": "最低得分",
-  "list.lensHas": "透镜包含…",
+  "list.lensHas": "透镜包含，如 健康,乐观",
   "list.lensFilter": "透镜筛选",
+  "list.lensAll": "同时包含所有 token",
 
   "tabs.examples": "示例",
   "tabs.chat": "对话",
@@ -1065,6 +1067,61 @@ function apply() {
   document.documentElement.lang = current;
   applyTranslations();
 }
+
+Object.assign(en, {
+  "lab.chatPosition": "Target position in full chat prompt",
+  "lab.configurations": "Independent residual settings",
+  "lab.addConfiguration": "Add neurons",
+  "lab.removeConfiguration": "Remove these settings",
+  "lab.addById": "Add neuron IDs",
+  "lab.invalidIds": "Enter valid IDs such as L22 N2742 (up to 32 settings).",
+  "lab.hold": "Keep residual interventions",
+  "lab.release": "Stop interventions",
+  "lab.holding": "Residual interventions active: {n} settings",
+  "lab.notHolding": "Residual interventions inactive",
+  "lab.holdHint": "Keeps a snapshot of the checked settings for subsequent evaluation and Chat only turns. Evaluation applies residual interventions only to the configured column; baseline and reversed-neuron columns have no held residual interventions. Stop and enable again to apply edits. Reloading or switching models stops them. Token scope uses absolute positions in the full chat prompt, including template and history. Experiments below apply all checked settings together.",
+  "lab.useSelected": "Add neuron selected on map",
+  "lab.selectConfiguration": "Include L{layer} N{n} in residual interventions",
+  "lab.selectionHint": "Each added neuron has its own settings. Check multiple rows to apply them together; click a row to edit that neuron. The shared input and generation options apply to the whole experiment.",
+  "lab.selectedNeurons": "Selected {selected} / {total} neurons:",
+  "lab.editingNeuron": "Editing settings for L{layer} N{n}",
+  "lab.noConfiguration": "Add neurons to configure their interventions.",
+  "lab.noSelection": "Select at least one residual setting.",
+  "lab.selectAll": "Select all",
+  "lab.selectNone": "Clear selection",
+  "lab.heldEdited": "Settings changed. Stop and keep interventions again to update the active snapshot.",
+  "lab.runSelected": "Run {n} input(s) × baseline / {settings} selected settings",
+  "lab.evaluationConfigured": "Configured neurons + residual interventions",
+  "lab.evaluationBaseline": "Baseline · no held residual interventions",
+  "lab.evaluationReversed": "Reversed neurons · no held residual interventions"
+});
+Object.assign(zh, {
+  "lab.chatPosition": "完整聊天提示词中的目标位置",
+  "lab.configurations": "独立残差干预设置",
+  "lab.addConfiguration": "添加神经元",
+  "lab.removeConfiguration": "删除当前设置",
+  "lab.addById": "按神经元编号添加",
+  "lab.invalidIds": "请输入有效编号，例如 L22 N2742，最多 32 份设置。",
+  "lab.hold": "保持残差流干预",
+  "lab.release": "停止干预",
+  "lab.holding": "残差流干预保持中：{n} 份设置",
+  "lab.notHolding": "残差流干预未保持",
+  "lab.holdHint": "保持后，勾选设置的快照用于后续评测和仅对话。评测仅在干预列应用残差设置，对照列与神经元符号取反列不应用所保持的残差干预。修改后请停止并重新保持；刷新页面或切换模型会停止。指定 token 使用完整聊天提示词（含模板和历史）的绝对位置。下方实验同时应用全部勾选设置。",
+  "lab.useSelected": "添加地图选中的神经元",
+  "lab.selectConfiguration": "将 L{layer} N{n} 纳入残差干预",
+  "lab.selectionHint": "每个添加的神经元对应一份独立设置。勾选可多选并同时干预；点击某行编辑该神经元。输入文本与生成选项由整组实验共用。",
+  "lab.selectedNeurons": "当前选中 {selected} / {total} 个神经元：",
+  "lab.editingNeuron": "正在编辑 L{layer} N{n} 的干预设置",
+  "lab.noConfiguration": "先添加神经元，再配置对应的干预。",
+  "lab.noSelection": "请至少勾选一份残差干预设置。",
+  "lab.selectAll": "全选",
+  "lab.selectNone": "取消全选",
+  "lab.heldEdited": "设置已修改。请先停止，再重新保持干预，以更新实际生效的快照。",
+  "lab.runSelected": "运行 {n} 条输入 × 对照 / {settings} 份选中设置联合干预",
+  "lab.evaluationConfigured": "所设神经元 + 残差干预",
+  "lab.evaluationBaseline": "对照 · 无保持的残差干预",
+  "lab.evaluationReversed": "神经元符号取反 · 无保持的残差干预"
+});
 
 export function setLang(lang) {
   const next = normalize(lang);

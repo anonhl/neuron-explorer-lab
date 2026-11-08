@@ -1,4 +1,4 @@
-import { t, localizeError } from "./i18n.js?v=24";
+import { t, localizeError } from "./i18n.js?v=27";
 
 const $ = id => document.getElementById(id);
 const phaseLabels = {

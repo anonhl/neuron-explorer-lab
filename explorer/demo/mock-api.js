@@ -383,7 +383,8 @@
       const adjusted = side === 0 ? [] : chatOps.map(op => ({ ...op, dose: side * op.dose }));
       const operations = [...batchOps, ...adjusted];
       const describe = op => "L" + op.layer + " N" + op.n + " " + (op.mode === "mul" ? "×" : "偏移 ") + op.dose;
-      const recipe = operations.slice(0, 3).map(describe).join("、");
+      const residuals = side === 1 ? body.residuals || [] : [];
+      const recipe = [...operations.slice(0, 3).map(describe), ...residuals.map(({ plan: p }) => `残差 L${p.layer} N${p.neuron} α=${p.strength}`)].join("、");
       const profile = operations.reduce((value, op) => op.mode === "mul" ? value * op.dose : value + op.dose, 1);
       const effect = profile - 1;
       const direction = Math.abs(effect) < 1e-6 ? 0 : Math.sign(effect);
@@ -477,7 +478,7 @@
     });
   }
   // A deterministic toy residual calculation, only for practicing the UI. No model runs here.
-  function residualExample(row, rows, plan, maxNew, targets) {
+  function residualExample(row, rows, plans, maxNew, targets) {
     const dot = (a, b) => a.reduce((sum, v, i) => sum + v * b[i], 0);
     const norm = a => Math.sqrt(dot(a, a));
     const unit = a => {
@@ -485,40 +486,46 @@
       if (!n || !Number.isFinite(n)) throw new Error('Direction is zero or invalid; choose a different direction or source pair.');
       return a.map(v => v / n);
     };
-    const stageOffset = { pre: 0, mid: .31, post: .67 }[plan.stage];
-    const position = plan.scope === 'token' ? plan.positions[row.id] : row.count - 1;
-    if (!Number.isInteger(position) || position < 0 || position >= row.count) throw new Error('Target token is outside the selected text.');
+    let plan = plans[0];
+    const position = row.count - 1;
     const state = (source, pos) => {
+      const stageOffset = { pre: 0, mid: .31, post: .67 }[plan.stage];
       const phase = noise(source.text) * 4 + (pos < 0 ? source.count - 1 : pos) * .13 + plan.layer * .09 + stageOffset;
       return Array.from({ length: arch.hidden }, (_, i) => Math.sin(i * .19 + phase) * (.15 + plan.layer * .004) + Math.cos(i * .041 - phase) * .04);
     };
     const before = state(row, position);
     const beforeNorm = norm(before);
     const find = id => { const source = rows.find(r => r.id === id); if (!source) throw new Error('请选择来源文本。'); return source; };
-    let direction;
-    if (plan.method === 'patch') direction = state(find(plan.source), plan.source_pos);
-    else if (plan.method !== 'remove') {
-      if (plan.direction === 'custom') {
-        if (!Array.isArray(plan.vector) || plan.vector.length !== arch.hidden) throw new Error('Custom direction must contain 2560 finite numbers.');
-        direction = unit(plan.vector);
-      } else if (plan.direction === 'difference') {
-        const a = state(find(plan.source), plan.source_pos), b = state(find(plan.reference), plan.reference_pos);
-        direction = unit(a.map((v, i) => v - b[i]));
-      } else direction = unit(before.map((_, i) => Math.sin(i * .17 + plan.neuron)));
+    let after = before;
+    for (plan of plans) {
+      const target = plan.scope === 'token' ? plan.positions[row.id] : position;
+      if (!Number.isInteger(target) || target < 0 || target >= row.count) throw new Error('Target token is outside the selected text.');
+      let direction;
+      if (plan.method === 'patch') direction = state(find(plan.source), plan.source_pos);
+      else if (plan.method !== 'remove') {
+        if (plan.direction === 'custom') {
+          if (!Array.isArray(plan.vector) || plan.vector.length !== arch.hidden) throw new Error('Custom direction must contain 2560 finite numbers.');
+          direction = unit(plan.vector);
+        } else if (plan.direction === 'difference') {
+          const a = state(find(plan.source), plan.source_pos), b = state(find(plan.reference), plan.reference_pos);
+          direction = unit(a.map((v, i) => v - b[i]));
+        } else direction = unit(before.map((_, i) => Math.sin(i * .17 + plan.neuron + plan.layer * .09)));
+      }
+      const alpha = plan.strength;
+      const currentNorm = norm(after);
+      if (plan.method === 'add') after = after.map((v, i) => v + alpha * currentNorm * direction[i]);
+      else if (plan.method === 'erase') {
+        const projection = dot(after, direction);
+        after = after.map((v, i) => v - alpha * projection * direction[i]);
+      } else if (plan.method === 'patch') after = after.map((v, i) => (1 - alpha) * v + alpha * direction[i]);
+      else {
+        const phase = plan.component === 'head' ? plan.head : plan.neuron;
+        const scale = plan.component === 'mlp' || plan.component === 'attention' ? .045 : .014;
+        const activation = .5 + noise(row.text + ':' + phase) * 2;
+        after = after.map((v, i) => v - alpha * activation * Math.sin(i * .17 + phase) * scale);
+      }
     }
-    const alpha = plan.strength;
-    let after;
-    if (plan.method === 'add') after = before.map((v, i) => v + alpha * beforeNorm * direction[i]);
-    else if (plan.method === 'erase') {
-      const projection = dot(before, direction);
-      after = before.map((v, i) => v - alpha * projection * direction[i]);
-    } else if (plan.method === 'patch') after = before.map((v, i) => (1 - alpha) * v + alpha * direction[i]);
-    else {
-      const phase = plan.component === 'head' ? plan.head : plan.neuron;
-      const scale = plan.component === 'mlp' || plan.component === 'attention' ? .045 : .014;
-      const activation = .5 + noise(row.text + ':' + phase) * 2;
-      after = before.map((v, i) => v - alpha * activation * Math.sin(i * .17 + phase) * scale);
-    }
+    plan = plans.reduce((a, b) => a.layer < b.layer ? a : b);
     const delta = after.map((v, i) => v - before[i]);
     const deltaNorm = norm(delta), changed = deltaNorm > 1e-12;
     const words = ['巴黎', '柏林', '伦敦', '北京', '猫咪', '科学', '因此', '。'];
@@ -565,7 +572,7 @@
       try {
         yield { type: 'start', simulated: true, total: rows.length, model_key: 'static-demo-residual-v2',
           compute_dtype: saved.settings.compute_dtype, quantization: saved.settings.quantization,
-          plan: body.plan, batch: selectedBatch() };
+          plan: body.plan, plans: body.plans || [body.plan], batch: selectedBatch() };
         for (const row of rows) {
           if (cancelled || signal?.aborted) return;
           yield { type: 'progress', id: row.id, phase: 'baseline' };
@@ -573,7 +580,7 @@
           yield { type: 'progress', id: row.id, phase: 'intervened' };
           await pause(300);
           if (cancelled || signal?.aborted) return;
-          yield residualExample(row, rows, body.plan, body.max_new, body.targets || []);
+          yield residualExample(row, rows, body.plans || [body.plan], body.max_new, body.targets || []);
         }
       } catch (error) { yield { type: 'error', error: error.message }; }
       yield { type: 'done', simulated: true, cancelled };
@@ -600,6 +607,7 @@
     if (path.startsWith("/api/neuron-batches")) return batchApi(path, options.method || "GET", body);
     if (path.startsWith("/api/agent/")) return agentApi(path, p, body, options.signal);
     switch (path) {
+      case '/api/residual/validate-held': return json({ residuals: body.residuals, simulated: true });
       case '/api/residual/tokens':
         try { return json({ texts: residualTextRows(body), model_key: 'static-demo-residual-v2', simulated: true }); }
         catch (error) { return json({ error: error.message }, 400); }

@@ -58,6 +58,39 @@ class ResidualTests(unittest.TestCase):
         return {'capture': 'test', 'model_key': trace['model_key'], 'residuals': trace, 'batch': trace['batch'],
                 'acts': acts, 'score': acts / .01, 'toks': ['one', 'two', 'three']}
 
+    def test_held_residual_changes_chat_logits_and_cleans_up(self):
+        from residual_interventions import validate_experiment
+        self.rt.messages_ids = lambda messages: [3, 8, 10]
+        self.rt.tok = type('Tokens', (), {
+            'pad_token_id': 0, 'convert_tokens_to_ids': lambda _, token: 63,
+            'decode': lambda _, ids, **kw: ' '.join(map(str, ids))})()
+        body = validate_experiment({
+            'texts': [{'id': 'a', 'text': 'A'}], 'max_new': 0,
+            'plan': dict(layer=31, neuron=0, method='add', direction='custom',
+                         vector=[1.] + [0.] * 31, stage='post', scope='continuation', strength=.5)
+        }, 32, 32, 48)
+        # A custom direction needs no source tokenizer; the source texts remain validation metadata.
+        self.rt.tok.__class__.__call__ = lambda _, text: SimpleNamespace(input_ids=[3, 8, 10])
+        self.rt.token_units = lambda ids: [('A', list(range(len(ids))))]
+        logits = []
+        handle = self.model.register_forward_hook(lambda mod, args, output: logits.append(output.logits.detach().clone()))
+        counts = [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()]
+        try:
+            list(self.rt.steer_multi([], [[{'role': 'user', 'content': 'A'}]], max_new=1))
+            base = logits[-1]
+            list(self.rt.steer_multi([], [[{'role': 'user', 'content': 'A'}]], max_new=1, residuals=[body]))
+            self.assertFalse(self.torch.allclose(base, logits[-1]))
+            self.assertEqual(counts, [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()])
+            list(self.rt.steer_multi([], [[{'role': 'user', 'content': 'A'}]], max_new=1))
+            self.torch.testing.assert_close(base, logits[-1])
+            generator = self.rt.steer_multi([], [[{'role': 'user', 'content': 'A'}]], max_new=3, residuals=[body])
+            next(generator)
+            generator.close()
+            self.assertEqual(counts, [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()])
+            self.assertIsNone(self.rt._push)
+        finally:
+            handle.remove()
+
     def test_all_32_layers_and_residual_conservation(self):
         from residuals import residual_rows
         snap = self.snapshot()
@@ -70,6 +103,31 @@ class ResidualTests(unittest.TestCase):
             if l:
                 self.np.testing.assert_array_equal(row['pre'], rows[l - 1]['post'])
         self.assertIsNone(self.rt._capture_residuals)
+
+    def test_five_selected_layers_are_jointly_intervened_and_baseline_stays_clean(self):
+        import threading
+        from residual_interventions import run_experiment, validate_experiment
+        self.rt.tok = type('Tokens', (), {
+            'eos_token_id': 63,
+            '__call__': lambda _, text, **kw: SimpleNamespace(input_ids=[3, 8, 10]),
+            'decode': lambda _, ids, **kw: ' '.join(map(str, ids)),
+            'convert_tokens_to_ids': lambda _, text: 63})()
+        self.rt.token_units = lambda ids: [('A', list(range(len(ids))))]
+        plans = [self.residual_plan(layer=l, neuron=l % 48, direction='neuron', scope='all', strength=.4)
+                 for l in (2, 7, 13, 21, 31)]
+        body = validate_experiment({'texts': [{'id': 'a', 'text': 'A'}], 'plans': plans, 'max_new': 0}, 32, 32, 48)
+        counts = [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()]
+        events = list(run_experiment(self.rt, body, threading.Event()))
+        result = next(e for e in events if e['type'] == 'result')
+        self.assertGreater(result['kl'], 0)
+        self.assertEqual([p['layer'] for p in events[0]['plans']], [2, 7, 13, 21, 31])
+        # The layers before the first intervention preserve their residual norms.
+        for row in result['layers'][:2]:
+            self.assertAlmostEqual(row['baseline'], row['intervened'])
+        self.assertEqual(counts, [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()])
+        zero = validate_experiment({**body, 'plans': [{**p, 'strength': 0} for p in plans]}, 32, 32, 48)
+        result = next(e for e in run_experiment(self.rt, zero, threading.Event()) if e['type'] == 'result')
+        self.assertEqual(result['kl'], 0)
 
     def test_signed_write_and_local_token_delta_without_rerunning_model(self):
         from residuals import inspect_residual

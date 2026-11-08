@@ -1,9 +1,9 @@
 import { createMap } from "./map3d.js?v=83";
 import { initResidualPanel } from "./residual-panel.js?v=3";
-import { initResidualLab } from "./residual-lab.js?v=1";
+import { initResidualLab } from "./residual-lab.js?v=3";
 import { createScatter } from "./scatter.js?v=39";
-import { t, tp, getLang, localizeError, applyTranslations } from "./i18n.js?v=24";
-import { initNeuronBatches } from "./neuron-batches.js?v=18";
+import { t, tp, getLang, localizeError, applyTranslations } from "./i18n.js?v=27";
+import { initNeuronBatches } from "./neuron-batches.js?v=21";
 import { initFrequencyPanel, lensFrequencyHTML, contextFrequency } from "./frequency.js?v=4";
 
 const $ = s => document.querySelector(s);
@@ -324,6 +324,7 @@ const residualPanel = initResidualPanel($("#lt-residual"), {
 });
 const residualLab = initResidualLab($("#tab-residual"), {
   api, t, esc, arch, errorText: localizeError,
+  onSelectionChange: () => syncChatSelection(),
   getSelected: () => state.focus?.kind === "neuron" ? state.focus : null,
   onNeuron: (layer, n) => goToNeuron(layer, n),
   onOpen: () => { focusEl.classList.add("on"); setFocusCollapsed(false); syncTabs(); setTab("residual"); },
@@ -493,6 +494,7 @@ document.querySelectorAll("#inf-sign button").forEach(b => b.onclick = () => {
 });
 let infTimer;
 for (const id of ["#inf-lo", "#inf-hi", "#inf-min", "#inf-q"]) $(id).addEventListener("input", () => { clearTimeout(infTimer); infTimer = setTimeout(inferView, 200); });
+$("#inf-q-all").addEventListener("change", () => { clearTimeout(infTimer); inferView(); });
 $("#inf-addresses").addEventListener("input", () => {
   ++viewGen;
   clearTimeout(infTimer);
@@ -603,7 +605,7 @@ async function inferView(g = qGen, pos = state.inf.pos) {
     try {
       const r = await api("/api/infer/common", { texts, sign: f.sign,
         lo: $("#inf-lo").value || 0, hi: $("#inf-hi").value || 99,
-        min: $("#inf-min").value || 0, q: $("#inf-q").value, addresses: exact || [] });
+        min: $("#inf-min").value || 0, q: $("#inf-q").value, q_all: $("#inf-q-all").checked, addresses: exact || [] });
       if (mine !== viewGen || g !== qGen) return;
       fireResults = { ...r, fires: true, common: true };
       renderResults(fireResults, $("#run-rows"));
@@ -626,7 +628,7 @@ async function inferView(g = qGen, pos = state.inf.pos) {
   }
   if (!f.text) return;
   const qs = new URLSearchParams({ pos, sign: f.sign, lo: $("#inf-lo").value || 0, hi: $("#inf-hi").value || 99,
-    min: $("#inf-min").value || 0, q: $("#inf-q").value, limit: 300 });
+    min: $("#inf-min").value || 0, q: $("#inf-q").value, q_all: $("#inf-q-all").checked, limit: 300 });
   if (exact) qs.set("addresses", exact.map(({ layer, n }) => `${layer}:${n}`).join(","));
   const r = await api(`/api/infer/view?${qs}`);
   if (mine !== viewGen || g !== qGen) return;
@@ -921,6 +923,7 @@ function setTab(t) {
   if (t === "claude") { const th = $("#a-thread"); th.scrollTop = th.scrollHeight; }
   if (t === "frequency") renderFrequency();
   if (t === "residual") residualLab.opened();
+  syncChatSelection();
 }
 // a tab that changed while another was showing gets a dot until opened
 function markFresh(t) { if (curTab() !== t) tabBtn(t).classList.add("fresh"); }
@@ -1287,8 +1290,9 @@ function syncChatView() {
 }
 function syncChatSelection() {
   const f = state.focus;
-  $("#focus-selection").hidden = f?.kind !== "neuron";
-  $("#focus-neuron-id").textContent = f?.kind === "neuron" ? `L${f.layer} N${f.n}` : "";
+  const neurons = curTab() === "residual" ? residualLab.getSelection() : f?.kind === "neuron" ? [f] : [];
+  $("#focus-selection").hidden = !neurons.length;
+  $("#focus-neuron-id").textContent = neurons.map(c => `L${c.layer} N${c.n}`).join(', ');
   syncChatNeuronControls();
 }
 function syncChatNeuronControls() {
@@ -1300,12 +1304,24 @@ function syncChatNeuronControls() {
   const save = $("#c-save-batch");
   save.hidden = !conversation || !neurons.length;
   save.disabled = !hasEnabled;
+  let residualStatus = $("#c-residual-status");
+  if (!residualStatus) {
+    residualStatus = document.createElement("p"); residualStatus.id = "c-residual-status";
+    residualStatus.className = "dim"; $("#c-operations").after(residualStatus);
+  }
+  const heldResiduals = residualLab.getHeld(), count = heldResiduals.length;
+  residualStatus.hidden = !count;
+  residualStatus.textContent = count ? `${t("lab.holding", { n: count })} · ${heldResiduals.map(({ plan: p }) => `L${p.layer} N${p.neuron}`).join(', ')}` : "";
   const hint = $("#c-dose-hint");
-  hint.hidden = reads;
+  hint.hidden = reads || (!hasEnabled && count > 0);
   hint.textContent = t(conversation
     ? (hasEnabled ? "chat.signedHint" : "chat.noAdjustments")
     : (hasEnabled ? "chat.magnitudeHint" : missingEvaluationNeuron()));
 }
+document.addEventListener("residualholdchange", ({ detail }) => {
+  if (!detail.count && running) running.ctl.abort();
+  syncChatNeuronControls();
+});
 function missingEvaluationNeuron() {
   return chatConfig().neurons.length ? "chat.enableForEvaluation" : "chat.addForEvaluation";
 }
@@ -1346,7 +1362,7 @@ function hasUnaddedNeurons() {
 }
 function validChatOperations(neurons) {
   if (hasUnaddedNeurons()) return null;
-  if (!neurons.length && !isConversation()) {
+  if (!neurons.length && !isConversation() && !residualLab.getHeld().length) {
     setChatError(missingEvaluationNeuron());
     return null;
   }
@@ -1363,15 +1379,16 @@ function chatNeuronRow(op, neurons) {
   row.className = "chat-operation";
   const id = `<span class="mono chat-neuron-id">L${op.layer} N${op.n}</span>`;
   row.innerHTML = `${op.doses ? `
-    <label class="chat-enable">${id}<input type="checkbox"><span data-i18n="batch.enabled"></span></label>
+    <label class="chat-enable">${id}<input type="checkbox"><span data-i18n="batch.enabled"></span></label>${copyNeuronButtonHTML()}
     <select data-i18n-aria-label="batch.mode"><option value="add" data-i18n="batch.modeAdd"></option><option value="mul" data-i18n="batch.modeMul"></option></select>
     <span class="stepper">
       <button type="button" data-step="-1" data-i18n-aria-label="chat.smaller">−</button>
       <input class="mono" inputmode="decimal" autocomplete="off" data-i18n-aria-label="${isConversation() ? "chat.signedDose" : "chat.magnitude"}">
       <button type="button" data-step="1" data-i18n-aria-label="chat.larger">+</button>
-    </span>` : id}
+    </span>` : id + copyNeuronButtonHTML()}
     <button type="button" class="chat-remove" data-i18n-aria-label="batch.remove">×</button>`;
   applyTranslations(row);
+  row.querySelector(".copy-neuron").onclick = () => copyNeuronId(row.querySelector(".copy-neuron"), `L${op.layer} N${op.n}`);
   if (op.doses) {
     const enabled = row.querySelector('input[type="checkbox"]');
     enabled.checked = op.enabled;
@@ -1448,6 +1465,8 @@ $("#c-form").addEventListener("input", () => setChatError());
 
 const ROWS = ["up", "zero", "down"];
 function turnLabels(turn) {
+  if (turn.residualCount) return [t("lab.evaluationConfigured"), t("lab.evaluationBaseline"), t("lab.evaluationReversed")];
+  if (!turn.operations.length) return [t("chat.configured"), t("chat.baseline"), t("chat.reversed")];
   if (turn.operations.length > 1) return [`▲ ${t("chat.configured")}`, t("chat.baseline"), `▼ ${t("chat.reversed")}`];
   const [{ mode, dose }] = turn.operations;
   return mode === "mul" ? [`▲ ×${dose}`, "×1", `▼ ×${-dose}`] : [`▲ ${fmtDose(dose)}`, "0", `▼ ${fmtDose(-dose)}`];
@@ -1455,6 +1474,8 @@ function turnLabels(turn) {
 function turnRecipe(turn) {
   const recipe = turn.operations.map(({ layer, n, mode, dose }) =>
     `L${layer} N${n} ${mode === "mul" ? `×${dose}` : fmtDose(dose)}`);
+  if (turn.residualCount) recipe.push(t("lab.holding", { n: turn.residualCount }));
+  if (turn.residuals?.length) recipe.push(turn.residuals.map(({ plan: p }) => `L${p.layer} N${p.neuron} ${p.stage} α=${p.strength}`).join(', '));
   if (turn.batchName) recipe.unshift(t("batch.chatBase", { name: turn.batchName }));
   return recipe.join(" · ");
 }
@@ -1485,12 +1506,13 @@ syncChatView();
 $("#c-form").addEventListener("submit", async e => {
   e.preventDefault();
   if (canStopChat()) { running.ctl.abort(); return; }
-  const f = state.focus; if (f?.kind !== "neuron" || reading) return;
+  const f = state.focus; if (reading) return;
   if (running) return;
   const single = isConversation(), group = state.chat.group;
   const text = $("#c-input").value.trim() || (single ? "" : $("#c-input").placeholder);
   if (!text) return;
   if (isChatReading()) {
+    if (f?.kind !== "neuron") return;
     if (!hasUnaddedNeurons()) return runReads(f, text);
     return;
   }
@@ -1498,7 +1520,8 @@ $("#c-form").addEventListener("submit", async e => {
   if (!operations) return;
   const { thread } = chatConfig();
   const history = thread.filter(t => !t.error).map(t => ({ user: t.user, replies: t.replies }));
-  const turn = { user: text, replies: single ? [""] : ["", "", ""], operations, focus: f,
+  const residuals = residualLab.getHeld();
+  const turn = { residuals, residualCount: residuals.length, user: text, replies: single ? [""] : ["", "", ""], operations, focus: f,
     batchName: batchPanel.getActive()?.name, live: true };
   thread.push(turn); $("#c-input").value = ""; renderThread(group);
   const el = chatThreadEl(group), cols = el.lastElementChild.querySelectorAll(".col");
@@ -1507,7 +1530,7 @@ $("#c-form").addEventListener("submit", async e => {
   syncChatButton();
   try {
     const res = await fetch("/api/steer", { method: "POST", headers: { "Content-Type": "application/json" }, signal: ctl.signal,
-      body: JSON.stringify({ group, operations, prompt: text, history }) });
+      body: JSON.stringify({ group, operations, residuals, prompt: text, history }) });
     if (!res.ok) throw new Error(`/api/steer ${res.status}: ${(await res.text()).slice(0, 160)}`);
     const reader = res.body.getReader(), dec = new TextDecoder();
     let buf = "", completed = false;

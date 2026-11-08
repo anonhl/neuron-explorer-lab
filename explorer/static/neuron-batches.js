@@ -1,4 +1,4 @@
-import { t, getLang, localizeError, applyTranslations } from "./i18n.js?v=24";
+import { t, getLang, localizeError, applyTranslations } from "./i18n.js?v=27";
 
 export function initNeuronBatches({ getSelected, onApplied }) {
   const $ = id => document.getElementById(id);

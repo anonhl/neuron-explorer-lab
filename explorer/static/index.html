@@ -4,7 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
 <title data-i18n="page.title">Neuron Explorer</title>
-<link rel="stylesheet" href="style.css?v=94">
+<link rel="stylesheet" href="style.css?v=98">
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 16 16%22%3E%3Crect width=%2216%22 height=%2216%22 rx=%223%22 fill=%22%23151515%22/%3E%3Ccircle cx=%228%22 cy=%228%22 r=%222.5%22 fill=%22%23ffd27a%22/%3E%3C/svg%3E">
 <script type="importmap">
 {"imports": {
@@ -170,8 +170,9 @@
           <span class="lab">L</span><input id="inf-lo" value="0" inputmode="numeric" aria-label="from layer" data-i18n-aria-label="list.fromLayer"><span class="lab">–</span><input id="inf-hi" value="31" inputmode="numeric" aria-label="to layer" data-i18n-aria-label="list.toLayer">
           <span class="seg" id="inf-sign"><button data-s="both" class="on">±</button><button data-s="+">+</button><button data-s="-">−</button></span>
           <span class="lab">≥</span><input id="inf-min" value="1.0" inputmode="decimal" aria-label="minimum score" data-i18n-aria-label="list.minScore">
-          <input id="inf-q" placeholder="lens has…" aria-label="lens filter" spellcheck="false" data-i18n-placeholder="list.lensHas" data-i18n-aria-label="list.lensFilter">
+          <input id="inf-q" placeholder="tokens, separated by commas…" aria-label="lens filter" spellcheck="false" data-i18n-placeholder="list.lensHas" data-i18n-aria-label="list.lensFilter">
         </div>
+        <label class="inf-lens-option"><input id="inf-q-all" type="checkbox"><span data-i18n="list.lensAll">Match all tokens</span></label>
         <input id="inf-addresses" placeholder="Neuron IDs, e.g. L0 N500, L0 N98" spellcheck="false" autocomplete="off" data-i18n-placeholder="list.addresses" data-i18n-aria-label="list.addresses">
       </div>
       <ol id="run-rows" class="rows"></ol>
@@ -225,14 +226,14 @@
   </aside>
 </main>
 <script type="module">
-import { initI18n, t, localizeError } from "./i18n.js?v=24";
-import { initModelLoading, initModelStatus } from "./model-loading.js?v=21";
+import { initI18n, t, localizeError } from "./i18n.js?v=27";
+import { initModelLoading, initModelStatus } from "./model-loading.js?v=24";
 
 initI18n(document.querySelector("#lang"));
 const openModelSettings = initModelLoading();
 function startExplorer() {
   document.body.classList.remove("model-setup");
-  import("./app.js?v=161").catch(error => {
+  import("./app.js?v=164").catch(error => {
     const status = document.querySelector("#status");
     const render = () => {
       status.textContent = t("error.label", { label: t("error.startup"), error: localizeError(error) });

@@ -40,7 +40,7 @@ export async function readResidualEvents(response, onEvent) {
   }
 }
 
-export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate, onOpen, getSelected, onNeuron }) {
+export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate, onOpen, getSelected, onNeuron, onSelectionChange = () => {} }) {
   const $ = s => document.querySelector(s), storeKey = 'ne.residual-inputs.v1';
   let texts = [{ id: 'text-1', label: 'A', text: '' }], serial = 1, active = 'text-1';
   try {
@@ -51,9 +51,32 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   } catch {}
   let tokens = new Map(), tokenChat = null, tokenVersion = 0, busy = false, preparing = false, ctl = null;
   let error = null, results = [], runSnapshot = null, progress = null, stale = false, stopped = false;
-  const form = { method: 'add', layer: 0, stage: 'post', scope: 'last', strength: 0.1, direction: 'neuron',
+  let form = { method: 'add', layer: 0, stage: 'post', scope: 'last', strength: 0.1, direction: 'neuron',
     neuron: 0, component: 'neuron', head: 0, source: texts[0].id, reference: texts[1]?.id || '',
-    source_pos: -1, reference_pos: -1, positions: {}, vector: '', chat: false, max_new: 48, targets: '' };
+    source_pos: -1, reference_pos: -1, positions: {}, chat_position: 0, vector: '', chat: false, max_new: 48, targets: '' };
+  let configurations = [], activeConfiguration = -1, held = [], holdVersion = 0, heldStale = false;
+  const selectedConfigurations = () => configurations.filter(c => c.selected);
+  const selection = () => selectedConfigurations().map(c => ({ layer: c.layer, n: c.neuron }));
+  const notifySelection = () => onSelectionChange(selection());
+  const notifyHeld = () => document.dispatchEvent(new CustomEvent('residualholdchange', { detail: { count: held.length } }));
+  function configurationPlan(config) {
+    const plan = { ...config, positions: { ...config.positions } };
+    for (const key of ['chat', 'targets', 'max_new', 'selected', 'chat_position']) delete plan[key];
+    if (plan.scope !== 'token') plan.positions = {};
+    if (['add', 'erase'].includes(plan.method) && plan.direction === 'custom') plan.vector = parseResidualVector(config.vector, arch.hidden);
+    else delete plan.vector;
+    return plan;
+  }
+  function configurationPayload(config) {
+    const plan = configurationPlan(config);
+    if (plan.scope === 'token') plan.chat_position = config.chat_position;
+    const rows = texts.filter(row => row.text.trim()).map(row => ({ ...row }));
+    const needsSource = plan.method === 'patch' || (['add', 'erase'].includes(plan.method) && plan.direction === 'difference');
+    if (needsSource && !rows.length) throw new Error(t('lab.fillInputs'));
+    if (!rows.length) rows.push({ id: active, text: 'Chat', label: 'A' });
+    if (plan.scope === 'token') plan.positions = Object.fromEntries(rows.map(row => [row.id, config.chat_position]));
+    return { texts: rows, chat: config.chat, plan, max_new: 0, targets: [] };
+  }
   const label = row => t('lab.text', { name: row.label });
   const save = () => { try { localStorage.setItem(storeKey, JSON.stringify({ texts, serial })); } catch {} };
   const current = () => texts.find(r => r.id === active);
@@ -63,8 +86,30 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   const number = (name, min, max, step = 1) => `<input name="${name}" type="number" value="${form[name]}" min="${min}" max="${max}" step="${step}" required>`;
   function dirty(invalidateTokens = false) {
     if (runSnapshot) stale = true;
+    if (held.length) heldStale = true;
     if (invalidateTokens) { tokens.clear(); ++tokenVersion; }
     error = null;
+  }
+  function addNeurons(addresses) {
+    const additions = addresses.filter((a, i) => !configurations.some(c => c.layer === a.layer && c.neuron === a.n)
+      && addresses.findIndex(b => b.layer === a.layer && b.n === a.n) === i);
+    if (configurations.length + additions.length > 32) throw new Error(t('lab.invalidIds'));
+    for (const a of additions) configurations.push({ ...structuredClone(form), layer: a.layer, neuron: a.n, selected: true });
+    for (const a of addresses) {
+      const index = configurations.findIndex(c => c.layer === a.layer && c.neuron === a.n);
+      configurations[index].selected = true;
+      activeConfiguration = index;
+    }
+    form = configurations[activeConfiguration]; dirty(); notifySelection(); render();
+  }
+  function renderConfigurations() {
+    root.querySelector('#rl-configurations').innerHTML = configurations.map((c, i) => `<div class="rl-config-row${i === activeConfiguration ? ' on' : ''}">
+      <input type="checkbox" data-enable="${i}" aria-label="${esc(t('lab.selectConfiguration', { layer: c.layer, n: c.neuron }))}" ${c.selected ? 'checked' : ''} ${busy || preparing ? 'disabled' : ''}>
+      <button type="button" data-config="${i}" aria-pressed="${i === activeConfiguration}" ${busy || preparing ? 'disabled' : ''}>${i + 1}. L${c.layer} N${c.neuron} · ${t(`lab.${c.method}`)} · α=${c.strength} · ${c.stage}</button></div>`).join('');
+    root.querySelector('#rl-selected-neurons').textContent = t('lab.selectedNeurons', { selected: selection().length, total: configurations.length })
+      + (selection().length ? ` ${selection().map(c => `L${c.layer} N${c.n}`).join(', ')}` : '');
+    root.querySelector('#rl-editing').textContent = activeConfiguration < 0 ? t('lab.noConfiguration') : t('lab.editingNeuron', { layer: form.layer, n: form.neuron });
+    root.querySelector('#rl-held-edited').textContent = heldStale ? t('lab.heldEdited') : '';
   }
   function setActive(id, analyze = true) {
     if (busy || !texts.some(r => r.id === id)) return;
@@ -73,6 +118,8 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
     if (analyze) onActivate(current().text);
   }
   function renderInputs() {
+    // Labels follow the current input order; IDs remain stable for cached results.
+    texts.forEach((row, index) => { row.label = String.fromCharCode(65 + index); });
     $('#inf-text-tabs').innerHTML = texts.map(row => `<button type="button" data-text-id="${esc(row.id)}" class="${row.id === active ? 'on' : ''}" aria-pressed="${row.id === active}" ${busy ? 'disabled' : ''}>${esc(label(row))}</button>`).join('');
     $('#inf-add-text').disabled = busy || texts.length >= 8;
     $('#inf-remove-text').disabled = busy || texts.length === 1;
@@ -84,7 +131,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   $('#inf-add-text').onclick = () => {
     if (busy || texts.length >= 8) return;
     ++serial;
-    const row = { id: `text-${serial}`, label: serial <= 26 ? String.fromCharCode(64 + serial) : String(serial), text: '' };
+    const row = { id: `text-${serial}`, label: String.fromCharCode(65 + texts.length), text: '' };
     texts.push(row);
     if (!form.reference) form.reference = row.id;
     dirty(true); setActive(row.id); save(); render(); $('#inf-text').focus();
@@ -92,9 +139,11 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   $('#inf-remove-text').onclick = () => {
     if (busy || texts.length === 1) return;
     texts = texts.filter(r => r.id !== active);
-    delete form.positions[active];
-    if (!texts.some(r => r.id === form.source)) { form.source = texts[0].id; form.source_pos = -1; }
-    if (!texts.some(r => r.id === form.reference)) { form.reference = texts.find(r => r.id !== form.source)?.id || ''; form.reference_pos = -1; }
+    for (const config of [form, ...configurations.filter(c => c !== form)]) {
+      delete config.positions[active];
+      if (!texts.some(r => r.id === config.source)) { config.source = texts[0].id; config.source_pos = -1; }
+      if (!texts.some(r => r.id === config.reference)) { config.reference = texts.find(r => r.id !== config.source)?.id || ''; config.reference_pos = -1; }
+    }
     dirty(true); setActive(texts[0].id); save(); render();
   };
   $('#inf-text').addEventListener('input', () => {
@@ -122,7 +171,15 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
     const usesNeuron = (isRemove && form.component === 'neuron') || (!isRemove && !isPatch && form.direction === 'neuron');
     const usesSource = isPatch || (!isRemove && form.direction === 'difference');
     root.innerHTML = `<p class="lab-intro">${t('lab.intro')}</p>
-      <form id="rl-form"><fieldset ${busy || preparing ? 'disabled' : ''}>
+      <div class="rl-section-heading"><strong>${t('lab.configurations')}</strong><button type="button" data-action="selected" ${busy || preparing ? 'disabled' : ''}>${t('lab.useSelected')}</button></div>
+      <p class="dim rl-hint">${t('lab.selectionHint')}</p><p id="rl-selected-neurons" class="mono rl-hint" role="status"></p>
+      <div id="rl-configurations" class="rl-input-list"></div>
+      <div class="rl-add-neurons"><label for="rl-neuron-address">${t('lab.addById')}</label><input id="rl-neuron-address" placeholder="L22 N2742, L23 N100" ${busy || preparing ? 'disabled' : ''}><button type="button" data-action="add-address" ${busy || preparing ? 'disabled' : ''}>${t('lab.addConfiguration')}</button></div>
+      <div class="rl-run-bar"><button type="button" data-action="select-all" ${busy || preparing ? 'disabled' : ''}>${t('lab.selectAll')}</button><button type="button" data-action="select-none" ${busy || preparing ? 'disabled' : ''}>${t('lab.selectNone')}</button><button type="button" data-action="remove-config" ${!configurations.length || busy || preparing ? 'disabled' : ''}>${t('lab.removeConfiguration')}</button></div>
+      <div class="rl-run-bar"><button type="button" data-action="hold" aria-pressed="${!!held.length}" ${busy || preparing || (!held.length && !selectedConfigurations().length) ? 'disabled' : ''}>${t(held.length ? 'lab.release' : 'lab.hold')}</button><span role="status">${held.length ? t('lab.holding', { n: held.length }) : t('lab.notHolding')}</span></div>
+      <p id="rl-held-edited" class="rl-stale" role="status"></p>
+      <p class="dim rl-hint">${t('lab.holdHint')}</p>
+      <form id="rl-form"><fieldset ${busy || preparing || !configurations.length ? 'disabled' : ''}>
       <div class="rl-section-heading"><strong>${t('lab.inputs')}</strong><button type="button" data-action="prepare">${t('lab.prepare')}</button></div>
       <p class="dim rl-hint">${t('lab.inputHint')}</p>
       <label class="rl-check"><input type="checkbox" name="chat" ${form.chat ? 'checked' : ''}>${t('lab.chat')}</label>
@@ -130,7 +187,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
         const tok = tokens.get(row.id), pos = form.positions[row.id] ?? (tok ? tok.count - 1 : '');
         return `<div class="rl-input-row"><button type="button" data-analyze="${esc(row.id)}">${esc(label(row))} ↗</button><span>${esc(row.text.slice(0, 100) || t('lab.emptyInput'))}</span><small>${tok ? t('lab.tokenCount', { n: tok.count }) : t('lab.notPrepared')}</small>${form.scope === 'token' ? field('lab.targetToken', `<select data-target="${esc(row.id)}">${tokenOptions(row.id, pos, false)}</select>`) : ''}</div>`;
       }).join('')}</div>
-      <div class="rl-section-heading"><strong>${t('lab.configuration')}</strong><button type="button" data-action="selected">${t('lab.useSelected')}</button></div>
+      <div class="rl-section-heading"><strong id="rl-editing"></strong></div>
       <div class="rl-fields">
       ${field('lab.method', choices('method', [['add', 'lab.add'], ['remove', 'lab.remove'], ['erase', 'lab.erase'], ['patch', 'lab.patch']]), 'class="rl-wide"')}
       ${field('batch.layer', number('layer', 0, arch.n_layers - 1))}
@@ -144,29 +201,38 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
       ${!isPatch && !isRemove && form.direction === 'difference' ? sourceFields('reference', 'lab.negativeSource') : ''}
       ${!isPatch && !isRemove && form.direction === 'custom' ? field('lab.vector', `<textarea name="vector" rows="3" spellcheck="false" placeholder="[0.1, -0.2, …]">${esc(form.vector)}</textarea>`, 'class="rl-wide"') : ''}
       ${field('lab.strength', number('strength', isPatch || form.method === 'erase' ? 0 : -10, isPatch || form.method === 'erase' ? 1 : 10, 'any'))}
+      ${form.scope === 'token' ? field('lab.chatPosition', number('chat_position', 0, 100000)) : ''}
       ${field('lab.maxNew', number('max_new', 0, 128))}
       ${field('lab.targets', `<textarea name="targets" rows="2" placeholder="${esc(t('lab.targetsPlaceholder'))}">${esc(form.targets)}</textarea>`, 'class="rl-wide"')}
       </div><p class="rl-method-note">${t(`lab.hint.${form.method}`)}</p>
       ${usesSource ? `<p class="dim rl-hint">${t('lab.alignmentHint')}</p>` : ''}
       <p class="dim rl-hint">${t('lab.scopeHint')}</p>
-      <button class="rl-primary" type="submit">${t('lab.runAll', { n: texts.length })}</button>
+      <button class="rl-primary" type="submit" ${!selectedConfigurations().length ? 'disabled' : ''}>${t('lab.runSelected', { n: texts.length, settings: selectedConfigurations().length })}</button>
       </fieldset></form>
       <div class="rl-run-bar"><span role="status" id="rl-progress"></span>${busy ? `<button type="button" data-action="stop">${t('chat.stop')}</button>` : ''}<button type="button" data-action="export" ${runSnapshot ? '' : 'disabled'}>${t('lab.export')}</button></div>
       <div id="rl-error" role="alert"></div><div id="rl-results"></div>`;
-    root.querySelector('#rl-form').onsubmit = e => { e.preventDefault(); run(); };
+    root.querySelector('#rl-form').onsubmit = e => { e.preventDefault(); return run(); };
+    renderConfigurations();
     renderResults();
   }
   root.addEventListener('input', e => {
-    if (e.target.dataset.target) { form.positions[e.target.dataset.target] = Number(e.target.value); dirty(); renderResults(); return; }
+    if (busy || preparing) return;
+    if (e.target.dataset.target) { form.positions[e.target.dataset.target] = Number(e.target.value); dirty(); renderConfigurations(); renderResults(); return; }
     const name = e.target.name;
     if (!name || e.target.tagName === 'SELECT' || e.target.type === 'checkbox') return;
     form[name] = e.target.type === 'number' ? Number(e.target.value) : e.target.value;
-    dirty(); renderResults();
+    if (['max_new', 'targets'].includes(name)) configurations.forEach(c => { c[name] = form[name]; });
+    dirty(); renderConfigurations(); notifySelection(); renderResults();
   });
   root.addEventListener('change', e => {
+    if (busy || preparing) return;
+    if (e.target.dataset.enable !== undefined) {
+      configurations[Number(e.target.dataset.enable)].selected = e.target.checked;
+      dirty(); notifySelection(); render(); return;
+    }
     const name = e.target.name;
     if (!name) return;
-    if (e.target.type === 'checkbox') { form[name] = e.target.checked; dirty(true); render(); return; }
+    if (e.target.type === 'checkbox') { configurations.forEach(c => { c[name] = e.target.checked; }); dirty(true); render(); return; }
     if (name === 'layer' && Number.isInteger(form.layer) && form.layer >= 0 && form.layer < arch.n_layers) {
       const heads = arch.layer_types[form.layer] === 'full_attention' ? arch.attn_heads : arch.linear_v_heads;
       if (form.head >= heads) form.head = 0;
@@ -182,16 +248,52 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
     if (form.method === 'remove' && (form.stage === 'pre' || ['neuron', 'mlp'].includes(form.component))) form.stage = 'post';
     dirty(); render();
   });
-  root.addEventListener('click', e => {
-    const b = e.target.closest('button'); if (!b) return;
+  root.addEventListener('click', async e => {
+    const b = e.target.closest('button'); if (!b || preparing) return;
+    if (busy && !['stop', 'export'].includes(b.dataset.action)) return;
+    if (b.dataset.config !== undefined && !busy) {
+      activeConfiguration = Number(b.dataset.config); form = configurations[activeConfiguration]; render(); return;
+    }
+    if (b.dataset.action === 'hold') {
+      if (held.length) { held = []; heldStale = false; notifyHeld(); render(); return; }
+      try {
+        if (!selectedConfigurations().length) throw new Error(t('lab.noSelection'));
+        preparing = true; render();
+        const payloads = structuredClone(selectedConfigurations().map(configurationPayload));
+        const version = ++holdVersion;
+        const checked = await api('/api/residual/validate-held', { residuals: payloads });
+        if (version === holdVersion) { held = checked.residuals; heldStale = false; notifyHeld(); }
+      } catch (err) { showError(err); }
+      finally { preparing = false; render(); }
+      return;
+    }
+    if (['select-all', 'select-none'].includes(b.dataset.action)) {
+      configurations.forEach(c => { c.selected = b.dataset.action === 'select-all'; });
+      dirty(); notifySelection(); render(); return;
+    }
+    if (b.dataset.action === 'remove-config' && configurations.length) {
+      configurations.splice(activeConfiguration, 1); activeConfiguration = Math.min(activeConfiguration, configurations.length - 1);
+      form = configurations[activeConfiguration] || { ...structuredClone(form), selected: false };
+      dirty(); notifySelection(); render(); return;
+    }
+    if (b.dataset.action === 'add-address' && !busy) {
+      const raw = root.querySelector('#rl-neuron-address').value.trim();
+      const matches = [...raw.matchAll(/L(\d+)\s*(?:N|[/:])\s*(\d+)/gi)];
+      const remainder = raw.replace(/L\d+\s*(?:N|[/:])\s*\d+/gi, '').replace(/[,，;；\s]+/g, '');
+      if (!matches.length || remainder || matches.some(m => +m[1] >= arch.n_layers || +m[2] >= arch.inter)) {
+        showError(new Error(t('lab.invalidIds'))); return;
+      }
+      try { addNeurons(matches.map(m => ({ layer: +m[1], n: +m[2] }))); } catch (err) { showError(err); }
+      return;
+    }
     if (b.dataset.analyze) { setActive(b.dataset.analyze); return; }
-    if (b.dataset.neuron) { onNeuron(Number(b.dataset.layer), Number(b.dataset.neuron)); return; }
+    if (b.dataset.neuron !== undefined) { onNeuron(Number(b.dataset.layer), Number(b.dataset.neuron)); return; }
     if (b.dataset.action === 'stop') { stopped = true; ctl?.abort(); return; }
     if (b.dataset.action === 'prepare') prepare().catch(showError);
     if (b.dataset.action === 'selected') {
       const selected = getSelected();
       if (!selected) { error = t('lab.selectNeuron'); renderResults(); return; }
-      form.layer = selected.layer; form.neuron = selected.n; dirty(); render();
+      try { addNeurons([selected]); } catch (err) { showError(err); }
     }
     if (b.dataset.action === 'export' && runSnapshot) {
       const blob = new Blob([JSON.stringify({ ...runSnapshot, results, stopped }, null, 2)], { type: 'application/json' });
@@ -211,24 +313,26 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
       const out = await api('/api/residual/tokens', { texts: rows, chat: form.chat });
       if (mine !== tokenVersion) throw new Error(t('lab.inputsChanged'));
       tokens = new Map(out.texts.map(row => [row.id, row])); tokenChat = form.chat;
-      for (const row of out.texts) {
-        if (form.positions[row.id] == null || form.positions[row.id] >= row.count) form.positions[row.id] = row.count - 1;
+      for (const config of configurations) {
+        for (const row of out.texts) {
+          if (config.positions[row.id] == null || config.positions[row.id] >= row.count) config.positions[row.id] = row.count - 1;
+        }
+        for (const name of ['source', 'reference']) if (config[`${name}_pos`] >= (tokens.get(config[name])?.count || 0)) config[`${name}_pos`] = -1;
       }
-      for (const name of ['source', 'reference']) if (form[`${name}_pos`] >= (tokens.get(form[name])?.count || 0)) form[`${name}_pos`] = -1;
     } finally { preparing = false; render(); }
   }
   async function run() {
     if (busy || preparing) return;
     try {
+      if (!selectedConfigurations().length) throw new Error(t('lab.noSelection'));
       inputSnapshot();
       if (tokens.size !== texts.length || tokenChat !== form.chat) await prepare();
-      const plan = { ...form, positions: { ...form.positions } };
-      delete plan.chat; delete plan.targets; delete plan.max_new;
-      if (['add', 'erase'].includes(form.method) && form.direction === 'custom') plan.vector = parseResidualVector(form.vector, arch.hidden);
-      else delete plan.vector;
-      if (['patch', 'erase'].includes(form.method) && !(form.strength >= 0 && form.strength <= 1)) throw new Error(t('lab.fractionError'));
-      if (form.method !== 'patch' && form.method !== 'remove' && form.direction === 'difference' && form.source === form.reference) throw new Error(t('lab.distinctSources'));
-      const payload = { texts: inputSnapshot(), chat: form.chat, plan, max_new: form.max_new,
+      const plans = selectedConfigurations().map(configurationPlan);
+      for (const plan of plans) {
+        if (['patch', 'erase'].includes(plan.method) && !(plan.strength >= 0 && plan.strength <= 1)) throw new Error(t('lab.fractionError'));
+        if (['add', 'erase'].includes(plan.method) && plan.direction === 'difference' && plan.source === plan.reference) throw new Error(t('lab.distinctSources'));
+      }
+      const payload = { texts: inputSnapshot(), chat: form.chat, plan: plans[0], plans, max_new: form.max_new,
         targets: form.targets.split('\n').filter(s => s.trim()) };
       runSnapshot = { request: structuredClone(payload), created_at: new Date().toISOString() };
       results = []; progress = null; stale = false; stopped = false; error = null; busy = true;
@@ -253,16 +357,18 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
       ? progress ? t('lab.progress', { text: row ? label(row) : progress.id, phase: t(`lab.${progress.phase}`), done: results.length, total: texts.length }) : t('lab.starting')
       : runSnapshot ? t(stopped ? 'lab.stopped' : error ? 'lab.failed' : 'lab.completed', { n: results.length }) : '';
     if (!runSnapshot) { target.innerHTML = `<p class="dim rl-hint">${t('lab.noResults')}</p>`; return; }
-    const p = runSnapshot.request.plan;
-    const route = [t(`lab.${p.method}`), `L${p.layer} ${p.stage}`, t(`lab.scope${{ token: 'Token', last: 'Last', prompt: 'Prompt', continuation: 'Continuation', all: 'All' }[p.scope]}`), `α=${p.strength}`];
-    const inputName = id => { const row = runSnapshot.request.texts.find(r => r.id === id); return row ? t('lab.text', { name: row.label }) : id; };
-    const posName = pos => pos === -1 ? t('lab.lastToken') : `#${pos}`;
-    if (p.method === 'remove') route.push(t(`lab.component${{ neuron: 'Neuron', mlp: 'MLP', attention: 'Attention', head: 'Head' }[p.component]}`));
-    if ((p.method === 'remove' && p.component === 'neuron') || (['add', 'erase'].includes(p.method) && p.direction === 'neuron')) route.push(`N${p.neuron}`);
-    if (p.method === 'remove' && p.component === 'head') route.push(`h${p.head}`);
-    if (p.method === 'patch' || (['add', 'erase'].includes(p.method) && p.direction === 'difference')) route.push(`${inputName(p.source)} ${posName(p.source_pos)}${p.method === 'patch' ? ' →' : ` − ${inputName(p.reference)} ${posName(p.reference_pos)}`}`);
+    const describePlan = p => {
+      const route = [t(`lab.${p.method}`), `L${p.layer} ${p.stage}`, t(`lab.scope${{ token: 'Token', last: 'Last', prompt: 'Prompt', continuation: 'Continuation', all: 'All' }[p.scope]}`), `α=${p.strength}`];
+      const inputName = id => { const row = runSnapshot.request.texts.find(r => r.id === id); return row ? t('lab.text', { name: row.label }) : id; };
+      const posName = pos => pos === -1 ? t('lab.lastToken') : `#${pos}`;
+      if (p.method === 'remove') route.push(t(`lab.component${{ neuron: 'Neuron', mlp: 'MLP', attention: 'Attention', head: 'Head' }[p.component]}`));
+      if ((p.method === 'remove' && p.component === 'neuron') || (['add', 'erase'].includes(p.method) && p.direction === 'neuron')) route.push(`N${p.neuron}`);
+      if (p.method === 'remove' && p.component === 'head') route.push(`h${p.head}`);
+      if (p.method === 'patch' || (['add', 'erase'].includes(p.method) && p.direction === 'difference')) route.push(`${inputName(p.source)} ${posName(p.source_pos)}${p.method === 'patch' ? ' →' : ` − ${inputName(p.reference)} ${posName(p.reference_pos)}`}`);
+      return `<span>${esc(route.join(' · '))}</span>`;
+    };
     const ctx = runSnapshot.context;
-    target.innerHTML = `<div class="rl-snapshot"><strong>${t('lab.runSnapshot')}</strong><span>${esc(route.join(' · '))}</span><small>${esc(new Date(runSnapshot.created_at).toLocaleString())}${ctx?.batch ? ` · ${esc(t('batch.chatBase', { name: ctx.batch.name }))}` : ''}</small></div>
+    target.innerHTML = `<div class="rl-snapshot"><strong>${t('lab.runSnapshot')}</strong>${runSnapshot.request.plans.map(describePlan).join('')}<small>${esc(new Date(runSnapshot.created_at).toLocaleString())}${ctx?.batch ? ` · ${esc(t('batch.chatBase', { name: ctx.batch.name }))}` : ''}</small></div>
       ${stale ? `<p class="rl-stale">${t('lab.stale')}</p>` : ''}
       ${results.length ? `<div class="rl-summary-wrap"><table class="rl-summary"><thead><tr><th>${t('lab.inputs')}</th><th>${t('lab.kl')}</th><th>${t('lab.topBase')}</th><th>${t('lab.topAlt')}</th></tr></thead><tbody>${results.map(r => `<tr><td><a href="#rl-result-${esc(r.id)}">${esc(t('lab.text', { name: r.label }))}</a></td><td>${r.kl.toPrecision(4)}</td><td>${esc(r.baseline.top[0]?.token || '')}</td><td>${esc(r.intervened.top[0]?.token || '')}</td></tr>`).join('')}</tbody></table></div>` : ''}
       ${results.map(resultHTML).join('')}`;
@@ -280,15 +386,20 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   }
   render();
   return { render, setActive,
+    getHeld() { return structuredClone(held); },
+    getSelection() { return selection(); },
     getInputs() { return texts.map(({ id, label, text }) => ({ id, label, text })); },
     getTexts() { return texts.map(row => row.text); },
     configure({ layer, n, stage, pos }) {
-      if (busy) return;
-      Object.assign(form, { layer, neuron: n, stage, scope: 'token', method: 'add', direction: 'neuron', strength: .1 });
-      form.positions[active] = pos; dirty(); render();
+      if (busy || preparing) return;
+      try {
+        addNeurons([{ layer, n }]);
+        Object.assign(form, { stage, scope: 'token', method: 'add', direction: 'neuron', strength: .1, chat_position: pos });
+        form.positions[active] = pos; dirty(); render();
+      } catch (err) { showError(err); }
     },
     externalText(text) { if (!busy && current().text !== text) { current().text = text; $('#inf-text').value = text; dirty(true); save(); render(); } },
-    invalidate() { ctl?.abort(); stopped = busy; dirty(true); render(); },
+    invalidate() { ++holdVersion; held = []; heldStale = false; notifyHeld(); ctl?.abort(); stopped = busy; dirty(true); render(); },
     opened() { render(); },
   };
 }
