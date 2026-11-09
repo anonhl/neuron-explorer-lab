@@ -13,6 +13,7 @@ uv sync --locked --python 3.12 --group dev --extra quantization --extra lora
 uv run --locked --group dev --extra quantization --extra lora python -m unittest discover -s tests -v
 node tests/test_residual_vector.mjs
 node tests/test_residual_lab.mjs
+node tests/test_residual_modes.mjs
 ```
 
 The dev group supplies httpx for API tests. Quantization tests require both backends. LoRA support requires the lora extra. Keep the required extras on subsequent uv sync commands. Tests use small tensors, mocks and a tiny randomly initialized Qwen model; they do not download real weights.

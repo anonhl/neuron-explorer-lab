@@ -14,6 +14,9 @@ MAX_TOKENS = 1024
 def validate_experiment(body, layers, hidden, inter):
     if not isinstance(body, dict):
         raise ValueError("Experiment must be an object.")
+    mode = body.get("mode", "joint")
+    if mode not in ("joint", "independent"):
+        raise ValueError("Choose joint or independent residual interventions.")
     if "plans" in body:
         plans = body["plans"]
         if not isinstance(plans, list) or not 1 <= len(plans) <= 32 or any(not isinstance(p, dict) for p in plans):
@@ -98,7 +101,7 @@ def validate_experiment(body, layers, hidden, inter):
     targets = body.get("targets", [])
     if not isinstance(targets, list) or len(targets) > 8 or any(not isinstance(t, str) or not t or len(t) > 200 for t in targets):
         raise ValueError("Provide up to 8 target continuations, each at most 200 characters.")
-    return {**body, "plan": p, "max_new": max_new, "targets": targets}
+    return {**body, "mode": mode, "plan": p, "max_new": max_new, "targets": targets}
 
 
 def tokenize_texts(rt, texts, chat=False):
@@ -258,6 +261,9 @@ def run_experiment(rt, body, cancel):
         rt.ensure_loaded()
         p = body["plan"]
         plans = body.get("plans", [p])
+        mode = body.get("mode", "joint")
+        groups = ([{"id": f"setting-{i + 1}", "plan_indices": [i]} for i in range(len(plans))]
+                  if mode == "independent" else [{"id": "joint", "plan_indices": list(range(len(plans)))}])
         rows = tokenize_texts(rt, body["texts"], body.get("chat", False))
         by_id = {r["id"]: r for r in rows}
         vectors = []
@@ -273,7 +279,7 @@ def run_experiment(rt, body, cancel):
         target_ids = [(text, rt.tok(text, add_special_tokens=False).input_ids) for text in body["targets"]]
         if any(not ids or len(ids) > 64 for _, ids in target_ids):
             raise ValueError("Each target continuation must contain 1 to 64 tokens.")
-        def run(row, enabled):
+        def run(row, indices):
             ids = row["ids"]
             position = len(ids) - 1
             with ExitStack() as stack:
@@ -281,10 +287,11 @@ def run_experiment(rt, body, cancel):
                 # Per-setting token positions are used only to target the edits.
                 observers = stack.enter_context(ResidualHooks(rt, {**p, "enabled": False}, len(ids), position))
                 hooks = []
-                for plan, vector in reversed(list(zip(plans, vectors))):
+                for i in reversed(indices):
+                    plan, vector = plans[i], vectors[i]
                     target = plan["positions"][row["id"]] if plan["scope"] == "token" else position
                     hooks.append(stack.enter_context(ResidualHooks(
-                        rt, {**plan, "enabled": enabled}, len(ids), target, vector, observe=False)))
+                        rt, {**plan, "enabled": True}, len(ids), target, vector, observe=False)))
                 out = rt.model(input_ids=torch.tensor([ids], device=rt.dev), use_cache=True, logits_to_keep=1)
                 lp = out.logits[0, -1].float().log_softmax(-1).cpu()
                 if not torch.isfinite(lp).all():
@@ -331,41 +338,50 @@ def run_experiment(rt, body, cancel):
                           "top": [{"id": int(i), "token": rt.tok.decode([int(i)]), "prob": float(v.exp())}
                                   for i, v in zip(top, values)]}
                 return public, lp, observers.layers, observers.neurons
-        yield {"type": "start", "total": len(rows), "batch": rt.batch_info(),
+        yield {"type": "start", "total": len(rows) * len(groups), "text_count": len(rows),
+               "mode": mode, "groups": groups, "batch": rt.batch_info(),
                "model_key": rt._weight_cache_key("residual"), "compute_dtype": rt.compute_dtype,
                "quantization": rt.quantization, "lora": rt.lora_path, "plan": p, "plans": plans}
-        for row in rows:
-            if cancel.is_set():
-                return
-            yield {"type": "progress", "id": row["id"], "phase": "baseline"}
-            baseline = run(row, False)
-            if baseline is None or cancel.is_set():
-                return
-            yield {"type": "progress", "id": row["id"], "phase": "intervened"}
-            intervened = run(row, True)
-            if intervened is None or cancel.is_set():
-                return
-            base, bp, bn, ba = baseline
-            alt, ap, an, aa = intervened
-            changes = ap.exp() - bp.exp()
-            top = changes.abs().topk(min(10, changes.numel())).indices
-            neurons = []
-            for layer in sorted(ba.keys() & aa.keys()):
-                d = aa[layer] - ba[layer]
-                for n in d.abs().topk(min(3, d.numel())).indices.tolist():
-                    if float(d[n]) != 0:
-                        neurons.append({"layer": layer, "n": n, "baseline": float(ba[layer][n]),
-                                        "intervened": float(aa[layer][n]), "delta": float(d[n])})
-            neurons.sort(key=lambda r: -abs(r["delta"]))
-            yield {"type": "result", "id": row["id"], "label": row.get("label", row["id"]), "text": row["text"],
-                   "position": len(row["ids"]) - 1,
-                   "positions": [plan["positions"][row["id"]] if plan["scope"] == "token" else len(row["ids"]) - 1 for plan in plans],
-                   "input_tokens": len(row["ids"]), "baseline": base, "intervened": alt,
-                   "kl": max(0., float((bp.exp() * (bp - ap)).sum())),
-                   "changes": [{"token": rt.tok.decode([int(i)]), "baseline": float(bp[i].exp()),
-                                "intervened": float(ap[i].exp()), "delta": float(changes[i])} for i in top],
-                   "layers": [{"layer": l, "baseline": bn[l], "intervened": an[l]} for l in sorted(bn)],
-                   "neurons": neurons[:16]}
+        baselines = {}
+        for group in groups:
+            indices = group["plan_indices"]
+            for row in rows:
+                if cancel.is_set():
+                    return
+                if row["id"] not in baselines:
+                    yield {"type": "progress", "group_id": group["id"], "id": row["id"], "phase": "baseline"}
+                    baseline = run(row, [])
+                    if baseline is None or cancel.is_set():
+                        return
+                    # Reuse immutable baseline measurements, never a model's generation cache.
+                    baselines[row["id"]] = baseline
+                yield {"type": "progress", "group_id": group["id"], "id": row["id"], "phase": "intervened"}
+                intervened = run(row, indices)
+                if intervened is None or cancel.is_set():
+                    return
+                base, bp, bn, ba = baselines[row["id"]]
+                alt, ap, an, aa = intervened
+                changes = ap.exp() - bp.exp()
+                top = changes.abs().topk(min(10, changes.numel())).indices
+                neurons = []
+                for layer in sorted(ba.keys() & aa.keys()):
+                    d = aa[layer] - ba[layer]
+                    for n in d.abs().topk(min(3, d.numel())).indices.tolist():
+                        if float(d[n]) != 0:
+                            neurons.append({"layer": layer, "n": n, "baseline": float(ba[layer][n]),
+                                            "intervened": float(aa[layer][n]), "delta": float(d[n])})
+                neurons.sort(key=lambda r: -abs(r["delta"]))
+                yield {"type": "result", "group_id": group["id"], "plan_indices": indices,
+                       "id": row["id"], "label": row.get("label", row["id"]), "text": row["text"],
+                       "position": len(row["ids"]) - 1,
+                       "positions": [plans[i]["positions"][row["id"]] if plans[i]["scope"] == "token" else len(row["ids"]) - 1
+                                     for i in indices],
+                       "input_tokens": len(row["ids"]), "baseline": base, "intervened": alt,
+                       "kl": max(0., float((bp.exp() * (bp - ap)).sum())),
+                       "changes": [{"token": rt.tok.decode([int(i)]), "baseline": float(bp[i].exp()),
+                                    "intervened": float(ap[i].exp()), "delta": float(changes[i])} for i in top],
+                       "layers": [{"layer": l, "baseline": bn[l], "intervened": an[l]} for l in sorted(bn)],
+                       "neurons": neurons[:16]}
 
 
 def prepare_chat_residual(rt, body, rows=None):

@@ -19,6 +19,7 @@ uv sync --locked --python 3.12 --group dev --extra quantization --extra lora
 uv run --locked --group dev --extra quantization --extra lora python -m unittest discover -s tests -v
 node tests/test_residual_vector.mjs
 node tests/test_residual_lab.mjs
+node tests/test_residual_modes.mjs
 ```
 
 前端检查建议使用 Node.js 22.7 或更新版本（支持无 package.json 时自动识别 ES 模块）。不需要 npm 安装或前端打包器。

@@ -51,6 +51,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   } catch {}
   let tokens = new Map(), tokenChat = null, tokenVersion = 0, busy = false, preparing = false, ctl = null;
   let error = null, results = [], runSnapshot = null, progress = null, stale = false, stopped = false;
+  let mode = 'joint', resultGroup = 'all';
   let form = { method: 'add', layer: 0, stage: 'post', scope: 'last', strength: 0.1, direction: 'neuron',
     neuron: 0, component: 'neuron', head: 0, source: texts[0].id, reference: texts[1]?.id || '',
     source_pos: -1, reference_pos: -1, positions: {}, chat_position: 0, vector: '', chat: false, max_new: 48, targets: '' };
@@ -165,6 +166,13 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   function sourceFields(name, key) {
     return field(key, textSelect(name)) + field('lab.sourceToken', `<select name="${name}_pos">${tokenOptions(form[name], form[`${name}_pos`])}</select>`);
   }
+  function experimentGroups(request) {
+    return request.mode === 'independent'
+      ? request.plans.map((plan, i) => ({ id: `setting-${i + 1}`, plans: [plan] }))
+      : [{ id: 'joint', plans: request.plans }];
+  }
+  const groupTitle = group => group.id === 'joint' ? t('lab.modeJoint') : `L${group.plans[0].layer} N${group.plans[0].neuron}`;
+  const resultId = r => `rl-result-${r.group_id || 'joint'}-${r.id}`;
   function render() {
     renderInputs();
     const isRemove = form.method === 'remove', isPatch = form.method === 'patch';
@@ -179,6 +187,9 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
       <div class="rl-run-bar"><button type="button" data-action="hold" aria-pressed="${!!held.length}" ${busy || preparing || (!held.length && !selectedConfigurations().length) ? 'disabled' : ''}>${t(held.length ? 'lab.release' : 'lab.hold')}</button><span role="status">${held.length ? t('lab.holding', { n: held.length }) : t('lab.notHolding')}</span></div>
       <p id="rl-held-edited" class="rl-stale" role="status"></p>
       <p class="dim rl-hint">${t('lab.holdHint')}</p>
+      <div class="rl-section-heading"><strong>${t('lab.experimentMode')}</strong></div>
+      <div class="rl-mode-picker" role="group" aria-label="${esc(t('lab.experimentMode'))}">${['joint', 'independent'].map(value => `<button type="button" data-mode="${value}" aria-pressed="${mode === value}" ${busy || preparing ? 'disabled' : ''}>${t(value === 'joint' ? 'lab.modeJoint' : 'lab.modeIndependent')}</button>`).join('')}</div>
+      <p class="dim rl-hint">${t(mode === 'joint' ? 'lab.modeJointHint' : 'lab.modeIndependentHint')}</p>
       <form id="rl-form"><fieldset ${busy || preparing || !configurations.length ? 'disabled' : ''}>
       <div class="rl-section-heading"><strong>${t('lab.inputs')}</strong><button type="button" data-action="prepare">${t('lab.prepare')}</button></div>
       <p class="dim rl-hint">${t('lab.inputHint')}</p>
@@ -207,7 +218,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
       </div><p class="rl-method-note">${t(`lab.hint.${form.method}`)}</p>
       ${usesSource ? `<p class="dim rl-hint">${t('lab.alignmentHint')}</p>` : ''}
       <p class="dim rl-hint">${t('lab.scopeHint')}</p>
-      <button class="rl-primary" type="submit" ${!selectedConfigurations().length ? 'disabled' : ''}>${t('lab.runSelected', { n: texts.length, settings: selectedConfigurations().length })}</button>
+      <button class="rl-primary" type="submit" ${!selectedConfigurations().length ? 'disabled' : ''}>${t(mode === 'joint' ? 'lab.runSelected' : 'lab.runIndependent', { n: texts.length, settings: selectedConfigurations().length, total: texts.length * selectedConfigurations().length })}</button>
       </fieldset></form>
       <div class="rl-run-bar"><span role="status" id="rl-progress"></span>${busy ? `<button type="button" data-action="stop">${t('chat.stop')}</button>` : ''}<button type="button" data-action="export" ${runSnapshot ? '' : 'disabled'}>${t('lab.export')}</button></div>
       <div id="rl-error" role="alert"></div><div id="rl-results"></div>`;
@@ -225,6 +236,7 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
     dirty(); renderConfigurations(); notifySelection(); renderResults();
   });
   root.addEventListener('change', e => {
+    if (e.target.id === 'rl-result-group') { resultGroup = e.target.value; renderResults(); return; }
     if (busy || preparing) return;
     if (e.target.dataset.enable !== undefined) {
       configurations[Number(e.target.dataset.enable)].selected = e.target.checked;
@@ -251,6 +263,12 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   root.addEventListener('click', async e => {
     const b = e.target.closest('button'); if (!b || preparing) return;
     if (busy && !['stop', 'export'].includes(b.dataset.action)) return;
+    if (b.dataset.mode) {
+      if (mode === b.dataset.mode) return;
+      mode = b.dataset.mode;
+      if (runSnapshot) stale = true;
+      error = null; render(); return;
+    }
     if (b.dataset.config !== undefined && !busy) {
       activeConfiguration = Number(b.dataset.config); form = configurations[activeConfiguration]; render(); return;
     }
@@ -332,10 +350,10 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
         if (['patch', 'erase'].includes(plan.method) && !(plan.strength >= 0 && plan.strength <= 1)) throw new Error(t('lab.fractionError'));
         if (['add', 'erase'].includes(plan.method) && plan.direction === 'difference' && plan.source === plan.reference) throw new Error(t('lab.distinctSources'));
       }
-      const payload = { texts: inputSnapshot(), chat: form.chat, plan: plans[0], plans, max_new: form.max_new,
+      const payload = { mode, texts: inputSnapshot(), chat: form.chat, plan: plans[0], plans, max_new: form.max_new,
         targets: form.targets.split('\n').filter(s => s.trim()) };
       runSnapshot = { request: structuredClone(payload), created_at: new Date().toISOString() };
-      results = []; progress = null; stale = false; stopped = false; error = null; busy = true;
+      results = []; resultGroup = 'all'; progress = null; stale = false; stopped = false; error = null; busy = true;
       ctl = new AbortController(); render();
       const response = await fetch('/api/residual/experiment', { method: 'POST', headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload), signal: ctl.signal });
@@ -352,9 +370,14 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
   function renderResults() {
     const target = root.querySelector('#rl-results'); if (!target) return;
     root.querySelector('#rl-error').textContent = error || '';
+    const groups = runSnapshot ? experimentGroups(runSnapshot.request) : [];
+    const independent = runSnapshot?.request.mode === 'independent';
+    const total = runSnapshot ? runSnapshot.request.texts.length * groups.length : 0;
     const row = progress && texts.find(r => r.id === progress.id);
+    const currentGroup = progress && groups.find(group => group.id === progress.group_id);
+    const progressName = `${independent && currentGroup ? `${groupTitle(currentGroup)} · ` : ''}${row ? label(row) : progress?.id}`;
     root.querySelector('#rl-progress').textContent = preparing ? t('lab.preparing') : busy
-      ? progress ? t('lab.progress', { text: row ? label(row) : progress.id, phase: t(`lab.${progress.phase}`), done: results.length, total: texts.length }) : t('lab.starting')
+      ? progress ? t('lab.progress', { text: progressName, phase: t(`lab.${progress.phase}`), done: results.length, total }) : t('lab.starting')
       : runSnapshot ? t(stopped ? 'lab.stopped' : error ? 'lab.failed' : 'lab.completed', { n: results.length }) : '';
     if (!runSnapshot) { target.innerHTML = `<p class="dim rl-hint">${t('lab.noResults')}</p>`; return; }
     const describePlan = p => {
@@ -368,15 +391,21 @@ export function initResidualLab(root, { api, t, esc, arch, errorText, onActivate
       return `<span>${esc(route.join(' · '))}</span>`;
     };
     const ctx = runSnapshot.context;
-    target.innerHTML = `<div class="rl-snapshot"><strong>${t('lab.runSnapshot')}</strong>${runSnapshot.request.plans.map(describePlan).join('')}<small>${esc(new Date(runSnapshot.created_at).toLocaleString())}${ctx?.batch ? ` · ${esc(t('batch.chatBase', { name: ctx.batch.name }))}` : ''}</small></div>
+    const groupRows = group => results.filter(r => (r.group_id || 'joint') === group.id);
+    const summaryHTML = rows => rows.length ? `<div class="rl-summary-wrap"><table class="rl-summary"><thead><tr><th>${t('lab.inputs')}</th><th>${t('lab.kl')}</th><th>${t('lab.topBase')}</th><th>${t('lab.topAlt')}</th></tr></thead><tbody>${rows.map(r => `<tr><td><a href="#${esc(resultId(r))}">${esc(t('lab.text', { name: r.label }))}</a></td><td>${r.kl.toPrecision(4)}</td><td>${esc(r.baseline.top[0]?.token || '')}</td><td>${esc(r.intervened.top[0]?.token || '')}</td></tr>`).join('')}</tbody></table></div>` : '';
+    target.innerHTML = `<div class="rl-snapshot"><strong>${t('lab.runSnapshot')} · ${t(independent ? 'lab.modeIndependent' : 'lab.modeJoint')}</strong>${runSnapshot.request.plans.map(describePlan).join('')}<small>${esc(new Date(runSnapshot.created_at).toLocaleString())}${ctx?.batch ? ` · ${esc(t('batch.chatBase', { name: ctx.batch.name }))}` : ''}</small></div>
       ${stale ? `<p class="rl-stale">${t('lab.stale')}</p>` : ''}
-      ${results.length ? `<div class="rl-summary-wrap"><table class="rl-summary"><thead><tr><th>${t('lab.inputs')}</th><th>${t('lab.kl')}</th><th>${t('lab.topBase')}</th><th>${t('lab.topAlt')}</th></tr></thead><tbody>${results.map(r => `<tr><td><a href="#rl-result-${esc(r.id)}">${esc(t('lab.text', { name: r.label }))}</a></td><td>${r.kl.toPrecision(4)}</td><td>${esc(r.baseline.top[0]?.token || '')}</td><td>${esc(r.intervened.top[0]?.token || '')}</td></tr>`).join('')}</tbody></table></div>` : ''}
-      ${results.map(resultHTML).join('')}`;
+      <p class="rl-hint" role="status">${t('lab.resultOverview', { groups: groups.length, texts: runSnapshot.request.texts.length, done: results.length, total })}</p>
+      ${independent ? `<label class="rl-result-filter">${t('lab.viewResults')}<select id="rl-result-group">${option('all', t('lab.allNeuronResults'), resultGroup)}${groups.map(group => option(group.id, `${groupTitle(group)} · ${groupRows(group).length}/${runSnapshot.request.texts.length}`, resultGroup)).join('')}</select></label>` : ''}
+      ${groups.filter(group => !independent || resultGroup === 'all' || group.id === resultGroup).map(group => {
+        const rows = groupRows(group);
+        return `<section class="rl-result-group">${independent ? `<div class="rl-section-heading"><strong>${esc(groupTitle(group))}</strong><span>${t('lab.groupProgress', { done: rows.length, total: runSnapshot.request.texts.length })}</span></div><div class="rl-group-plan">${group.plans.map(describePlan).join('')}</div>` : ''}${summaryHTML(rows)}${rows.map(resultHTML).join('')}${!rows.length ? `<p class="dim rl-hint">${t('lab.noCompletedResults')}</p>` : ''}</section>`;
+      }).join('')}`;
   }
   const percent = n => `${(n * 100).toPrecision(4)}%`;
   function resultHTML(r) {
     const variant = (v, key) => `<div class="rl-variant"><strong>${t(key)}</strong><div class="rl-output">${esc(v.output || t('lab.noGeneration'))}</div><div class="rl-top">${v.top.map(x => `<span>${esc(x.token)} <small>${percent(x.prob)}</small></span>`).join('')}</div></div>`;
-    return `<article class="rl-result" id="rl-result-${esc(r.id)}"><div class="rl-section-heading"><strong>${esc(t('lab.text', { name: r.label }))}</strong><span class="mono">KL ${r.kl.toPrecision(4)}</span></div>
+    return `<article class="rl-result" id="${esc(resultId(r))}"><div class="rl-section-heading"><strong>${esc(t('lab.text', { name: r.label }))}</strong><span class="mono">KL ${r.kl.toPrecision(4)}</span></div>
       <p class="rl-prompt">${esc(r.text)}</p><p class="dim rl-hint">${t('lab.measurement', { pos: r.position, count: r.input_tokens })}</p>
       <div class="rl-pair">${variant(r.baseline, 'lab.baseline')}${variant(r.intervened, 'lab.intervened')}</div>
       ${r.baseline.targets.length ? `<div class="rl-summary-wrap"><table class="rl-summary"><thead><tr><th>${t('lab.target')}</th><th>${t('lab.baseLogprob')}</th><th>${t('lab.altLogprob')}</th><th>Δ log p</th></tr></thead><tbody>${r.baseline.targets.map((x, i) => `<tr><td>${esc(x.text)}</td><td>${x.logprob.toFixed(4)}</td><td>${r.intervened.targets[i].logprob.toFixed(4)}</td><td>${(r.intervened.targets[i].logprob - x.logprob).toFixed(4)}</td></tr>`).join('')}</tbody></table></div>` : ''}

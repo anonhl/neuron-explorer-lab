@@ -567,20 +567,30 @@
   function residualExperiment(body, signal) {
     let rows;
     try { rows = residualTextRows(body); } catch (error) { return json({ error: error.message }, 400); }
+    const mode = body.mode === undefined ? 'joint' : body.mode;
+    if (!['joint', 'independent'].includes(mode)) return json({ error: 'Choose joint or independent residual interventions.' }, 400);
+    const plans = body.plans || [body.plan];
+    const groups = mode === 'independent'
+      ? plans.map((_, i) => ({ id: `setting-${i + 1}`, plan_indices: [i] }))
+      : [{ id: 'joint', plan_indices: plans.map((_, i) => i) }];
     let cancelled = false;
     async function* events() {
       try {
-        yield { type: 'start', simulated: true, total: rows.length, model_key: 'static-demo-residual-v2',
+        yield { type: 'start', simulated: true, total: rows.length * groups.length, text_count: rows.length,
+          mode, groups, model_key: 'static-demo-residual-v2',
           compute_dtype: saved.settings.compute_dtype, quantization: saved.settings.quantization,
-          plan: body.plan, plans: body.plans || [body.plan], batch: selectedBatch() };
-        for (const row of rows) {
-          if (cancelled || signal?.aborted) return;
-          yield { type: 'progress', id: row.id, phase: 'baseline' };
-          await pause(250);
-          yield { type: 'progress', id: row.id, phase: 'intervened' };
-          await pause(300);
-          if (cancelled || signal?.aborted) return;
-          yield residualExample(row, rows, body.plans || [body.plan], body.max_new, body.targets || []);
+          plan: plans[0], plans, batch: selectedBatch() };
+        for (const group of groups) {
+          for (const row of rows) {
+            if (cancelled || signal?.aborted) return;
+            yield { type: 'progress', group_id: group.id, id: row.id, phase: 'baseline' };
+            await pause(250);
+            yield { type: 'progress', group_id: group.id, id: row.id, phase: 'intervened' };
+            await pause(300);
+            if (cancelled || signal?.aborted) return;
+            yield { ...residualExample(row, rows, group.plan_indices.map(i => plans[i]), body.max_new, body.targets || []),
+              group_id: group.id, plan_indices: group.plan_indices };
+          }
         }
       } catch (error) { yield { type: 'error', error: error.message }; }
       yield { type: 'done', simulated: true, cancelled };

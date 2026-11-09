@@ -129,6 +129,47 @@ class ResidualTests(unittest.TestCase):
         result = next(e for e in run_experiment(self.rt, zero, threading.Event()) if e['type'] == 'result')
         self.assertEqual(result['kl'], 0)
 
+    def test_independent_results_match_running_each_neuron_alone(self):
+        import threading
+        from residual_interventions import run_experiment, validate_experiment
+        class Tokens:
+            eos_token_id = 63
+            def __call__(self, text, **kwargs):
+                return SimpleNamespace(input_ids={'A': [3, 8, 10], 'B': [3, 11, 9, 12], 'answer': [5, 6]}[text])
+            def decode(self, ids, **kwargs): return ' '.join(f'token-{i}' for i in ids)
+            def convert_tokens_to_ids(self, _): return 63
+        self.rt.tok = Tokens()
+        self.rt.token_units = lambda ids: [(f'token-{i}', [t]) for t, i in enumerate(ids)]
+        plans = [
+            self.residual_plan(layer=2, neuron=7, scope='token', positions={'a': 0, 'b': 1}, strength=.4),
+            self.residual_plan(layer=21, neuron=8, strength=-.2),
+            self.residual_plan(layer=31, neuron=9, strength=0),
+        ]
+        body = validate_experiment({'mode': 'independent', 'texts': [{'id': 'a', 'text': 'A'}, {'id': 'b', 'text': 'B'}],
+                                    'plans': plans, 'max_new': 2, 'targets': ['answer']}, 32, 32, 48)
+        counts = [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()]
+        events = list(run_experiment(self.rt, body, threading.Event()))
+        self.assertEqual(events[0]['total'], 6)
+        results = [e for e in events if e['type'] == 'result']
+        for i, plan in enumerate(plans):
+            independent = [r for r in results if r['group_id'] == f'setting-{i + 1}']
+            single = validate_experiment({**body, 'mode': 'joint', 'plans': [plan]}, 32, 32, 48)
+            alone = [e for e in run_experiment(self.rt, single, threading.Event()) if e['type'] == 'result']
+            self.assertEqual([r['id'] for r in independent], ['a', 'b'])
+            for actual, expected in zip(independent, alone):
+                for key in ('baseline', 'intervened', 'kl', 'changes', 'layers', 'neurons', 'positions'):
+                    self.assertEqual(actual[key], expected[key], (i, key))
+                self.assertEqual(actual['baseline'], results[['a', 'b'].index(actual['id'])]['baseline'])
+        for row in results[-2:]:  # A zero-strength setting must remain identical to baseline.
+            self.assertEqual(row['baseline'], row['intervened'])
+            self.assertEqual(row['kl'], 0)
+        self.assertEqual(counts, [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()])
+        generator = run_experiment(self.rt, body, threading.Event())
+        for event in generator:
+            if event['type'] == 'result': break
+        generator.close()
+        self.assertEqual(counts, [(len(m._forward_hooks), len(m._forward_pre_hooks)) for m in self.model.modules()])
+
     def test_signed_write_and_local_token_delta_without_rerunning_model(self):
         from residuals import inspect_residual
         snap = self.snapshot()
@@ -348,6 +389,14 @@ class ResidualTests(unittest.TestCase):
             self.assertEqual([e['id'] for e in events if e['type'] == 'result'], ['a', 'b'])
             self.assertEqual(events[-1]['type'], 'done')
             self.assertTrue(all(e['kl'] == 0 for e in events if e['type'] == 'result'))
+            independent = {**body, 'mode': 'independent', 'plans': [body['plan'], {**body['plan'], 'layer': 31}]}
+            response = client.post('/api/residual/experiment', json=independent)
+            events = [json.loads(line[6:]) for line in response.text.splitlines() if line.startswith('data: ')]
+            self.assertEqual(events[0]['total'], 4)
+            self.assertEqual([(e['group_id'], e['id']) for e in events if e['type'] == 'result'],
+                             [('setting-1', 'a'), ('setting-1', 'b'), ('setting-2', 'a'), ('setting-2', 'b')])
+            self.assertEqual(events[-1]['type'], 'done')
+            self.assertEqual(client.post('/api/residual/experiment', json={**body, 'mode': 'invalid'}).status_code, 400)
             self.assertEqual(client.post('/api/residual/experiment', json={**body, 'plan': {**body['plan'], 'layer': 32}}).status_code, 400)
             broken = {**body, 'plan': {**body['plan'], 'direction': 'custom', 'vector': [0.] * 32}}
             response = client.post('/api/residual/experiment', json=broken)

@@ -9,7 +9,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from types import MethodType
 import unittest
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 ROOT = Path(__file__).resolve().parents[1] / 'explorer'
 
@@ -112,6 +112,101 @@ class HeldResidualTests(unittest.TestCase):
             with self.subTest(invalid=invalid), self.assertRaises(ValueError):
                 validate({**body, 'plans': invalid}, 32, 4, 48)
         self.assertNotIn('plans', validate(body, 32, 4, 48))  # Legacy single setting stays supported.
+
+    def test_experiment_modes_are_validated_and_legacy_requests_default_to_joint(self):
+        validate = self.ns['validate_experiment']
+        body = self.request()
+        self.assertEqual(validate(body, 32, 4, 48)['mode'], 'joint')
+        for mode in ('joint', 'independent'):
+            for plans in (None, [body['plan'], self.request(layer=4)['plan']]):
+                request = {**body, 'mode': mode, **({'plans': plans} if plans else {})}
+                self.assertEqual(validate(request, 32, 4, 48)['mode'], mode)
+        for mode in ('unknown', '', None, False, [], {}):
+            with self.subTest(mode=mode), self.assertRaises(ValueError):
+                validate({**body, 'mode': mode}, 32, 4, 48)
+
+    def test_independent_experiment_isolates_five_settings_across_five_texts(self):
+        """Run actual orchestration with instrumented hooks; numerical tests use the tiny Qwen model."""
+        active, forwards, prepared = [], [], []
+        state = SimpleNamespace(fail_neuron=None)
+        class Hook:
+            def __init__(self, rt, plan, prompt_len, position, vector=None, **kwargs):
+                self.plan, self.position = plan, position
+                self.layers, self.neurons = {}, {}
+            def __enter__(self): active.append(self); return self
+            def __exit__(self, *args): active.remove(self)
+        logits = MagicMock()
+        lp = logits[0, -1].float().log_softmax(-1).cpu()
+        lp.numel.return_value = 1
+        lp.topk.return_value = ([], [])
+        changes = lp.exp() - lp.exp()
+        changes.numel.return_value = 1
+        changes.abs().topk.return_value = SimpleNamespace(indices=[])
+        def forward(**kwargs):
+            edits = [(h.plan['neuron'], h.position) for h in active if h.plan['enabled']]
+            forwards.append((kwargs['input_ids'][0], edits))
+            if any(neuron == state.fail_neuron for neuron, _ in edits):
+                raise RuntimeError('example failure')
+            # Each measured run must create its own prefill, without sharing a generation cache.
+            self.assertNotIn('past_key_values', kwargs)
+            return SimpleNamespace(logits=logits)
+        def prepare(rt, body, **kwargs):
+            self.assertEqual(active, [])
+            prepared.append(body['plan']['neuron'])
+        torch = SimpleNamespace(inference_mode=nullcontext, tensor=lambda data, **kw: data,
+                                isfinite=lambda value: SimpleNamespace(all=lambda: True))
+        self.ns.update({'torch': torch, 'ExitStack': ExitStack, 'ResidualHooks': Hook,
+                        'prepare_chat_residual': prepare, 'MAX_TOKENS': 1024})
+        load_function('residual_interventions.py', 'tokenize_texts', self.ns)
+        run = load_function('residual_interventions.py', 'run_experiment', self.ns)
+        tokenizer = SimpleNamespace(eos_token_id=63, convert_tokens_to_ids=lambda _: 63,
+                                    decode=lambda ids, **kw: str(ids))
+        class Tokens:
+            eos_token_id = 63
+            convert_tokens_to_ids = staticmethod(tokenizer.convert_tokens_to_ids)
+            decode = staticmethod(tokenizer.decode)
+            def __call__(self, text, **kw): return SimpleNamespace(input_ids=[int(text), 10])
+        rt = SimpleNamespace(lock=threading.RLock(), ensure_loaded=lambda: None, model=forward,
+                             tok=Tokens(), token_units=lambda ids: [(str(ids), [0, 1])], dev='cpu',
+                             batch_info=lambda: None, _weight_cache_key=lambda _: 'test',
+                             compute_dtype='float32', quantization='none', lora_path=None)
+        texts = [{'id': str(i), 'text': str(i)} for i in range(5)]
+        plans = [self.request(layer=i, neuron=i, scope='token', positions={r['id']: i % 2 for r in texts})['plan']
+                 for i in range(5)]
+        body = self.ns['validate_experiment']({'mode': 'independent', 'texts': texts, 'plans': plans, 'max_new': 0}, 32, 4, 48)
+        events = list(run(rt, body, threading.Event()))
+        rows = [e for e in events if e['type'] == 'result']
+        self.assertEqual(events[0]['total'], 25)
+        self.assertEqual(events[0]['text_count'], 5)
+        self.assertEqual(len(events[0]['groups']), 5)
+        self.assertEqual(prepared, list(range(5)))
+        self.assertEqual(len(forwards), 30)  # Five clean baselines, plus 25 independent interventions.
+        self.assertEqual(sum(not edits for _, edits in forwards), 5)
+        self.assertEqual([edits for _, edits in forwards if edits], [[(i, i % 2)] for i in range(5) for _ in texts])
+        for i in range(5):
+            group_rows = [r for r in rows if r['group_id'] == f'setting-{i + 1}']
+            self.assertEqual([r['id'] for r in group_rows], [r['id'] for r in texts])
+            self.assertTrue(all(r['plan_indices'] == [i] and r['positions'] == [i % 2] for r in group_rows))
+        self.assertEqual(active, [])
+
+        forwards.clear()
+        joint = list(run(rt, {**body, 'mode': 'joint'}, threading.Event()))
+        self.assertEqual(joint[0]['total'], 5)
+        self.assertEqual(len([e for e in joint if e['type'] == 'result']), 5)
+        self.assertTrue(all(len(edits) in (0, 5) for _, edits in forwards))
+        self.assertEqual(active, [])
+
+        cancel = threading.Event()
+        generator = run(rt, body, cancel)
+        for event in generator:
+            if event['type'] == 'result': break
+        cancel.set()
+        self.assertEqual(list(generator), [])
+        self.assertEqual(active, [])
+        state.fail_neuron = 2
+        with self.assertRaisesRegex(RuntimeError, 'example failure'):
+            list(run(rt, body, threading.Event()))
+        self.assertEqual(active, [])
 
     def test_comparison_cancellation_stops_remaining_rows(self):
         steer = load_function('runtime.py', 'steer_multi', {}, 'Runtime')

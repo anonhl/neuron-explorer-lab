@@ -12,6 +12,7 @@ A Windows-focused workbench for Qwen3.5-4B neuron and residual-stream experiment
 
 - **Residual experiments:** add a direction, remove a write, erase a projection or patch a state at a chosen layer, stage and token position; rerun the model to compare behavior.
 - **Multi-text comparisons:** up to eight independent inputs; compare generation, next-token probabilities, KL divergence, target-continuation scores and activations; export JSON.
+- **Joint or independent interventions:** select multiple neurons and apply them together, or test each one separately on every input. Independent results are grouped and filterable by neuron; five neurons and five texts produce five groups with 25 comparisons. The JSON export records the mode and each result's group. Kept chat interventions still apply all checked settings together.
 - **Reusable neuron batches:** save named groups of ordered operations with model/precision metadata; activate, replace or stop a batch.
 - **Model-loading choices:** BF16/FP16, bitsandbytes/HQQ weight quantization, and optional local LoRA with full weights.
 - **Local use and teaching:** Windows/offline guides, bundled Three.js, frequency inspection and a standalone simulated HTML demo.
